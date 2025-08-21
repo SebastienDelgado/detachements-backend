@@ -1,4 +1,4 @@
-// server.js — Détachements API (CommonJS) avec envoi d'e-mails via Nodemailer
+// server.js — Détachements API (CommonJS) + Nodemailer (Mailtrap ready)
 
 const express = require('express');
 const cors = require('cors');
@@ -9,22 +9,25 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// --- CORS ---
+// ---------- CORS ----------
 app.use(
   cors({
     origin: (origin, cb) => {
-      const allowed = (process.env.CORS_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
-      if (!origin) return cb(null, true); // autoriser accès direct (curl, même origine)
+      const allowed = (process.env.CORS_ORIGINS || '')
+        .split(',')
+        .map(o => o.trim())
+        .filter(Boolean);
+      if (!origin) return cb(null, true); // autoriser même origine / curl
       if (allowed.includes('*') || allowed.includes(origin)) return cb(null, true);
       cb(new Error('Not allowed by CORS: ' + origin));
     },
   })
 );
 
-// --- Body JSON ---
+// ---------- Body JSON ----------
 app.use(express.json());
 
-// --- Page d'accueil + Health ---
+// ---------- Accueil + Health ----------
 app.get('/', (req, res) => {
   res.type('html').send(`
     <style>body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:2rem;line-height:1.5}code{background:#f6f8fa;border-radius:6px;padding:.1rem .3rem}</style>
@@ -42,22 +45,19 @@ app.get('/', (req, res) => {
 });
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-// --- Mémoire (simple) ---
-// ⚠️ Simple pour démarrer : se réinitialise si le service redémarre.
-const REQUESTS = [];
+// ---------- Mémoire (simple, sans BDD) ----------
+const REQUESTS = []; // se vide si le service redémarre
 
-// --- Utils ---
+// ---------- Utils ----------
 function normalizeDate(input) {
   if (!input) return input;
-  // déjà au bon format YYYY-MM-DD
-  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) return input;
-  // format européen DD/MM/YYYY
-  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(input);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) return input; // déjà YYYY-MM-DD
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(input); // DD/MM/YYYY
   if (m) {
     const [, dd, mm, yyyy] = m;
     return `${yyyy}-${mm}-${dd}`;
   }
-  return input; // autre chose : laisser tel quel
+  return input;
 }
 
 function computeDays(dFrom, dTo, startP, endP) {
@@ -79,12 +79,9 @@ function computeDays(dFrom, dTo, startP, endP) {
   if (endP === 'AM') total -= 0.5;
   return total;
 }
+function isEmail(x) { return typeof x === 'string' && /.+@.+\..+/.test(x); }
 
-function isEmail(x) {
-  return typeof x === 'string' && /.+@.+\..+/.test(x);
-}
-
-// --- Auth minimal (sans JWT) ---
+// ---------- Auth minimal (sans JWT) ----------
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@example.com';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me';
 
@@ -103,7 +100,7 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// --- Transport mail (Nodemailer) ---
+// ---------- Transport mail (Mailtrap ou SMTP réel) ----------
 function createTransport() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
@@ -111,43 +108,31 @@ function createTransport() {
   const pass = process.env.SMTP_PASS;
 
   if (!host) {
-    console.warn('[MAIL] SMTP non configuré. Remplis SMTP_HOST/PORT/USER/PASS pour envoyer des e-mails.');
-    // Transport “no-op” qui n’envoie pas mais évite de crasher
-    return {
-      sendMail: async () => {
-        throw new Error('SMTP non configuré (SMTP_HOST manquant)');
-      },
-    };
+    console.warn('[MAIL] SMTP non configuré (SMTP_HOST manquant) → aucun envoi possible.');
+    // Transport “no-op” : lève une erreur à l’envoi
+    return { sendMail: async () => { throw new Error('SMTP non configuré'); } };
   }
 
-  const secure = port === 465; // 465 = SSL, sinon STARTTLS sur 587
-  const base = {
-    host,
-    port,
-    secure,
-  };
-
-  if (user && pass) {
-    base.auth = { user, pass };
-  }
+  const secure = port === 465; // 465 = SSL, sinon STARTTLS (587)
+  const base = { host, port, secure };
+  if (user && pass) base.auth = { user, pass };
 
   const transporter = nodemailer.createTransport(base);
   console.log('[MAIL] SMTP prêt :', host + ':' + port, secure ? '(SSL)' : '(STARTTLS)');
   return transporter;
 }
-
 const mailer = createTransport();
 
-// --- Créer une demande (publique) ---
+// ---------- Créer une demande (publique) ----------
 app.post('/api/requests', (req, res) => {
   try {
     const body = req.body || {};
 
-    // Normaliser dates
+    // normaliser dates
     body.dateFrom = normalizeDate(body.dateFrom);
-    body.dateTo = normalizeDate(body.dateTo || body.dateFrom);
+    body.dateTo   = normalizeDate(body.dateTo || body.dateFrom);
 
-    // Contrôles
+    // contrôles
     if (!body.fullName || !body.entity || !body.place) {
       return res.status(400).json({ error: 'Champs requis manquants (nom, entité, lieu)' });
     }
@@ -156,15 +141,15 @@ app.post('/api/requests', (req, res) => {
       return res.status(400).json({ error: 'Format de date invalide (utiliser AAAA-MM-JJ)' });
     }
     const startPeriod = (body.startPeriod || 'FULL').toUpperCase();
-    const endPeriod = (body.endPeriod || 'FULL').toUpperCase();
-    if (!['AM', 'PM', 'FULL'].includes(startPeriod)) return res.status(400).json({ error: 'startPeriod doit être AM, PM ou FULL' });
-    if (!['AM', 'PM', 'FULL'].includes(endPeriod)) return res.status(400).json({ error: 'endPeriod doit être AM, PM ou FULL' });
+    const endPeriod   = (body.endPeriod   || 'FULL').toUpperCase();
+    if (!['AM','PM','FULL'].includes(startPeriod)) return res.status(400).json({ error: 'startPeriod doit être AM, PM ou FULL' });
+    if (!['AM','PM','FULL'].includes(endPeriod))   return res.status(400).json({ error: 'endPeriod doit être AM, PM ou FULL' });
     const type = (body.type || '21B').toUpperCase();
-    if (!['21B', '21C'].includes(type)) return res.status(400).json({ error: 'type doit être 21B ou 21C' });
-    if (!isEmail(body.managerEmail)) return res.status(400).json({ error: 'E-mail du N+1 invalide' });
-    if (!isEmail(body.hrEmail)) return res.status(400).json({ error: 'E-mail du DDRH/RH invalide' });
+    if (!['21B','21C'].includes(type)) return res.status(400).json({ error: 'type doit être 21B ou 21C' });
+    if (!isEmail(body.managerEmail)) return res.status(400).json({ error: "E-mail du N+1 invalide" });
+    if (!isEmail(body.hrEmail))      return res.status(400).json({ error: "E-mail du DDRH/RH invalide" });
 
-    const id = randomUUID();
+    const id   = randomUUID();
     const days = computeDays(body.dateFrom, body.dateTo, startPeriod, endPeriod);
 
     const item = {
@@ -193,17 +178,17 @@ app.post('/api/requests', (req, res) => {
   }
 });
 
-// --- Lister (admin) ---
+// ---------- Lister (admin) ----------
 app.get('/api/requests', requireAuth, (req, res) => {
   const { status, entity, type } = req.query;
   let items = REQUESTS.slice();
   if (status) items = items.filter(r => r.status === status);
   if (entity) items = items.filter(r => r.entity === entity);
-  if (type) items = items.filter(r => r.type === type);
+  if (type)   items = items.filter(r => r.type === type);
   return res.json({ items });
 });
 
-// --- Valider & envoyer (admin) ---
+// ---------- Valider & envoyer (admin) ----------
 app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   const { id } = req.params;
   const r = REQUESTS.find(x => x.id === id);
@@ -229,7 +214,7 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
     address: process.env.MAIL_FROM || 'no-reply@example.com',
   };
   const to = [r.manager_email, r.hr_email].filter(Boolean).join(', ');
-  const cc = ['sdelgado.csecsg@gmail.com', 'sebastien.delgado@socgen.com'].join(', ');
+  const cc = ['reine.allaglo@csec-sg.com', 'chrystelle.agea@socgen.com'].join(', ');
 
   try {
     const info = await mailer.sendMail({ from, to, cc, subject, text });
@@ -242,9 +227,8 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   }
 });
 
-// --- Start ---
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`API running on port ${PORT}`);
 });
-ort ${PORT}`);
-});
+
