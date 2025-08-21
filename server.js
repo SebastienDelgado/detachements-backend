@@ -1,4 +1,4 @@
-// server.js — Détachements API (CommonJS) + Nodemailer (Mailtrap ready)
+// server.js — Détachements API (CommonJS) + Nodemailer + "(Hors délai de route)"
 
 const express = require('express');
 const cors = require('cors');
@@ -109,7 +109,6 @@ function createTransport() {
 
   if (!host) {
     console.warn('[MAIL] SMTP non configuré (SMTP_HOST manquant) → aucun envoi possible.');
-    // Transport “no-op” : lève une erreur à l’envoi
     return { sendMail: async () => { throw new Error('SMTP non configuré'); } };
   }
 
@@ -203,7 +202,8 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
     `${r.full_name}${r.entity ? ' – ' + r.entity : ''}`,'',
     `Le(s) : ${dates}`,
     `À : ${r.place}`,
-    `En article 21 : ${r.type}${r.days ? ' – ' + (r.days % 1 === 0.5 ? (Math.floor(r.days)+',5') : r.days) + ' jour(s)' : ''}`,'',
+    `En article 21 : ${r.type}${r.days ? ' – ' + (r.days % 1 === 0.5 ? (Math.floor(r.days)+',5') : r.days) + ' jour(s)' : ''}`,
+    '(Hors délai de route)','',              // <- ajouté ici
     'Bonne fin de journée,','',
     'Sébastien DELGADO','Secrétaire Adjoint – CSEC SG',
     'sebastien.delgado@csec-sg.com','06 74 98 48 68',
