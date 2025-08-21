@@ -2,6 +2,7 @@
   "name": "detachements-backend",
   "version": "1.0.0",
   "private": true,
+  "description": "API Détachements CSEC SG",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -17,3 +18,4 @@
     "nodemailer": "^6.9.13"
   }
 }
+
