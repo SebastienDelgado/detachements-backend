@@ -1,4 +1,4 @@
-// server.js — Détachements API (CommonJS) + Nodemailer + "(Hors délai de route)"
+// server.js — Détachements API (CommonJS) + Nodemailer (HTML Arial 12 + couleurs) + dates FR
 
 const express = require('express');
 const cors = require('cors');
@@ -40,6 +40,7 @@ app.get('/', (req, res) => {
       <li><code>POST /api/auth/login</code> — login admin</li>
       <li><code>GET /api/requests?status=pending|sent</code> — lister (admin)</li>
       <li><code>POST /api/requests/:id/validate</code> — valider & envoyer</li>
+      <li><code>GET /api/requests/export.csv</code> — (optionnel) export CSV complet</li>
     </ul>
   `);
 });
@@ -59,7 +60,11 @@ function normalizeDate(input) {
   }
   return input;
 }
-
+function toFR(d){ // 'YYYY-MM-DD' -> 'DD/MM/YYYY'
+  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return d || "";
+  const [y,m,dd] = d.split("-");
+  return `${dd}/${m}/${y}`;
+}
 function computeDays(dFrom, dTo, startP, endP) {
   if (!dFrom || !dTo) return 0;
   const from = new Date(dFrom + 'T00:00:00Z');
@@ -100,7 +105,7 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// ---------- Transport mail (Mailtrap ou SMTP réel) ----------
+// ---------- Transport mail ----------
 function createTransport() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
@@ -187,6 +192,46 @@ app.get('/api/requests', requireAuth, (req, res) => {
   return res.json({ items });
 });
 
+// ---------- (Optionnel) Export CSV complet ----------
+function csvEscape(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  return /[",\n;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function buildCSV(items) {
+  const header = [
+    "Prénom & Nom","Entité","Dates","Lieu","Article 21","Nb jours",
+    "N+1","DDRH/RH","Statut","Créé le","Validé le"
+  ].join(";");
+  const rows = items.map(r => {
+    const dates =
+      r.date_from === r.date_to
+        ? toFR(r.date_from) + (r.start_period !== 'FULL' ? (r.start_period === 'AM' ? " (Matin)" : " (Après-midi)") : "")
+        : `${toFR(r.date_from)} → ${toFR(r.date_to)}`
+          + (r.start_period === 'PM' ? " (Début: Après-midi)" : "")
+          + (r.end_period === 'AM' ? " (Fin: Matin)" : "");
+    const created = r.created_at ? new Date(r.created_at).toLocaleString("fr-FR") : "";
+    const validated = r.validated_at ? new Date(r.validated_at).toLocaleString("fr-FR") : "";
+    const fields = [
+      r.full_name, r.entity, dates, r.place, r.type, r.days,
+      r.manager_email, r.hr_email, r.status, created, validated
+    ].map(csvEscape);
+    return fields.join(";");
+  });
+  return [header, ...rows].join("\n");
+}
+app.get('/api/requests/export.csv', requireAuth, (req, res) => {
+  try {
+    const csv = buildCSV(REQUESTS);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="detachements-export-complet.csv"');
+    res.send(csv);
+  } catch (e) {
+    console.error('CSV export error:', e);
+    res.status(500).json({ error: 'Export CSV failed' });
+  }
+});
+
 // ---------- Valider & envoyer (admin) ----------
 app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   const { id } = req.params;
@@ -194,20 +239,58 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   if (!r) return res.status(404).json({ error: 'Not found' });
   if (r.status === 'sent') return res.json({ ok: true, already: true });
 
+  // Données & formats FR
+  const datesFR = r.date_from === r.date_to
+    ? toFR(r.date_from)
+    : `${toFR(r.date_from)} au ${toFR(r.date_to)}`;
+  const daysLabel = (r.days % 1 === 0.5 ? (Math.floor(r.days)+',5') : r.days) + ' jour' + (r.days > 1 ? 's' : '');
+
+  // Couleur des variables
+  const VAR = '#D71620';
+
+  // Sujet
   const subject = `Détachement – ${r.full_name}`;
-  const dates = r.date_from === r.date_to ? r.date_from : `${r.date_from} au ${r.date_to}`;
+
+  // Corps texte (fallback)
   const text = [
     'Bonjour,','',
     'Merci de bien vouloir noter le détachement de :',
     `${r.full_name}${r.entity ? ' – ' + r.entity : ''}`,'',
-    `Le(s) : ${dates}`,
+    `Le(s) : ${datesFR}`,
     `À : ${r.place}`,
-    `En article 21 : ${r.type}${r.days ? ' – ' + (r.days % 1 === 0.5 ? (Math.floor(r.days)+',5') : r.days) + ' jour(s)' : ''}`,
-    '(Hors délai de route)','',              // <- ajouté ici
+    `En article 21 : ${r.type} – ${daysLabel}`,
+    '(Hors délai de route)','',
     'Bonne fin de journée,','',
     'Sébastien DELGADO','Secrétaire Adjoint – CSEC SG',
     'sebastien.delgado@csec-sg.com','06 74 98 48 68',
   ].join('\n');
+
+  // Corps HTML (Arial 12, noir / variables en #D71620)
+  const html = `
+  <div style="font-family: Arial, Helvetica, sans-serif; font-size: 12pt; color: #000000; line-height: 1.5;">
+    <p>Bonjour,</p>
+
+    <p>Merci de bien vouloir noter le détachement de :<br />
+      <span style="color:${VAR};">${escapeHtml(r.full_name)}${r.entity ? ' – ' + escapeHtml(r.entity) : ''}</span>
+    </p>
+
+    <p>
+      Date(s) du détachement : <span style="color:${VAR};">${escapeHtml(datesFR)}</span><br />
+      À : <span style="color:${VAR};">${escapeHtml(r.place)}</span><br />
+      En article 21 : <span style="color:${VAR};">${escapeHtml(r.type)} – ${escapeHtml(daysLabel)}</span><br />
+      <span>(Hors délai de route)</span>
+    </p>
+
+    <p>Bonne fin de journée,</p>
+
+    <p>
+      Sébastien DELGADO<br />
+      Secrétaire Adjoint – CSEC SG<br />
+      <a href="mailto:sebastien.delgado@csec-sg.com" style="color:#000000; text-decoration:none;">sebastien.delgado@csec-sg.com</a><br />
+      06 74 98 48 68
+    </p>
+  </div>
+  `;
 
   const from = {
     name: process.env.MAIL_FROM_NAME || 'CSEC SG – Détachements',
@@ -217,7 +300,7 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   const cc = ['reine.allaglo@csec-sg.com', 'chrystelle.agea@socgen.com'].join(', ');
 
   try {
-    const info = await mailer.sendMail({ from, to, cc, subject, text });
+    const info = await mailer.sendMail({ from, to, cc, subject, text, html });
     r.status = 'sent';
     r.validated_at = new Date().toISOString();
     return res.json({ ok: true, messageId: info && info.messageId ? info.messageId : 'sent' });
@@ -226,6 +309,17 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
     return res.status(500).json({ error: 'Email send failed', detail: e.message });
   }
 });
+
+// -- petite fonction d'échappement HTML pour éviter les surprises --
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ---------- Start ----------
 app.listen(PORT, () => {
