@@ -297,7 +297,7 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
     address: process.env.MAIL_FROM || 'no-reply@example.com',
   };
   const to = [r.manager_email, r.hr_email].filter(Boolean).join(', ');
-  const cc = ['reine.allaglo@csec-sg.com', 'chrystelle.agea@socgen.com'].join(', ');
+  const cc = ['sdelgado.csecsg@gmail.com', 'seb.delgado1076@gmail.com'].join(', ');
 
   try {
     const info = await mailer.sendMail({ from, to, cc, subject, text, html });
