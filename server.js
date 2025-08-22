@@ -278,7 +278,7 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
     'Bonjour,','',
     'Merci de bien vouloir noter le détachement de :',
     `${r.full_name}${r.entity ? ' – ' + r.entity : ''}`,'',
-    `Le(s) : ${datesFR}`,
+    `Date(s) du détachement : ${datesFR}`,
     `À : ${r.place}`,
     `En article 21 : ${r.type} – ${daysLabel}`,
     '(Hors délai de route)','',
@@ -294,7 +294,7 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
       <span style="color:${VAR_COLOR};">${escapeHtml(r.full_name)}${r.entity ? ' – ' + escapeHtml(r.entity) : ''}</span>
     </p>
     <p>
-      Le(s) : <span style="color:${VAR_COLOR};">${escapeHtml(datesFR)}</span><br />
+      Date(s) du détachement : <span style="color:${VAR_COLOR};">${escapeHtml(datesFR)}</span><br />
       À : <span style="color:${VAR_COLOR};">${escapeHtml(r.place)}</span><br />
       En article 21 : <span style="color:${VAR_COLOR};">${escapeHtml(r.type)} – ${escapeHtml(daysLabel)}</span><br />
       <span>(Hors délai de route)</span>
@@ -342,7 +342,7 @@ function buildDecisionMail({ fullName, datesFR, place, type, daysLabel, reason, 
     '',
     `Motif : ${reason || '—'}`,
     '',
-    'Cordialement,','CSEC SG'
+    'Cordialement,','Sébastien DELGADO - Secrétaire Adjoint CSEC SG'
   ].join('\n');
 
   const html = `
@@ -356,7 +356,7 @@ function buildDecisionMail({ fullName, datesFR, place, type, daysLabel, reason, 
       Article 21 : <span style="color:${VAR_COLOR};">${escapeHtml(type)} – ${escapeHtml(daysLabel)}</span>
     </p>
     <p>Motif : <span style="color:${VAR_COLOR};">${escapeHtml(reason || '—')}</span></p>
-    <p>Cordialement,<br/>CSEC SG</p>
+    <p>Cordialement,<br/>Sébastien DELGADO - Secrétaire Adjoint CSEC SG</p>
   </div>
   `;
   return { subject, text, html };
