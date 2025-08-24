@@ -1,12 +1,12 @@
-// server.js — backend complet (mémoire) pour la recette/POC
-// Routes utilisées par le front :
-//  - POST   /api/auth/login
+// server.js — backend complet (recette, stockage en mémoire)
+// Routes consommées par le front :
 //  - GET    /api/health
+//  - POST   /api/auth/login
 //  - POST   /api/requests
 //  - GET    /api/requests?status=pending|sent|refused|cancelled
 //  - POST   /api/requests/:id/validate
-//  - POST   /api/requests/:id/refuse   (body: { reason })
-//  - POST   /api/requests/:id/cancel   (body: { reason })
+//  - POST   /api/requests/:id/refuse     (body: { reason })
+//  - POST   /api/requests/:id/cancel     (body: { reason })
 
 const express = require('express');
 const cors = require('cors');
@@ -17,11 +17,25 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ---------- Utilitaires ----------
-function normalizeEmail(s) { return (s || '').trim().replace(/\s+/g, ''); }
-function isEmail(s) { return /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test((s || '').trim()); }
+function normalizeEmail(s) {
+  // Supprime les espaces Unicode "invisibles" + trim
+  return (s || '')
+    .replace(/[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/g, '')
+    .trim();
+}
+function isEmail(s) {
+  // Regex plus permissive (accepte +, ', etc.)
+  const re = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+  return re.test((s || '').trim());
+}
 function toFR(dateStr) {
-  try { if (!dateStr) return '—'; const [y, m, d] = dateStr.split('-'); return `${d}/${m}/${y}`; }
-  catch { return dateStr || '—'; }
+  try {
+    if (!dateStr) return '—';
+    const [y, m, d] = dateStr.split('-');
+    return `${d}/${m}/${y}`;
+  } catch {
+    return dateStr || '—';
+  }
 }
 function computeDays(dFrom, dTo, startP, endP) {
   if (!dFrom) return 0;
@@ -68,12 +82,14 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS || "YOUR_MAILTRAP_PASS"
   }
 });
+
 const MAIL_FROM      = process.env.MAIL_FROM      || 'test@example.com';
 const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Sébastien DELGADO';
 
 // ---------- Middleware ----------
 app.use(cors({
   origin: (origin, cb) => {
+    // Autorise explicitement les origines listées (séparées par des virgules)
     const allowed = (process.env.CORS_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
     if (!origin || allowed.length === 0 || allowed.includes(origin)) cb(null, true);
     else cb(new Error('Not allowed by CORS'));
@@ -125,7 +141,7 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// Création d'une demande (publique)
+// --- Création d'une demande (publique) ---
 app.post('/api/requests', async (req, res) => {
   try {
     let {
@@ -138,6 +154,7 @@ app.post('/api/requests', async (req, res) => {
     managerEmail   = normalizeEmail(managerEmail);
     hrEmail        = normalizeEmail(hrEmail);
 
+    // Vérifs de base
     if (!fullName || !entity || !place || !dateFrom) {
       return res.status(400).json({ error: "Champs requis manquants (nom, entité, lieu, date de début)." });
     }
@@ -146,6 +163,8 @@ app.post('/api/requests', async (req, res) => {
     if (!isEmail(hrEmail))        return res.status(400).json({ error: "Adresse e-mail DDRH/RH invalide." });
 
     if (!dateTo) dateTo = dateFrom;
+
+    // Cohérence périodes sur une seule journée
     if (dateFrom === dateTo && startPeriod === "PM" && endPeriod === "AM") {
       return res.status(400).json({ error: "Pour une même journée, choisissez Matin puis Après-midi, ou Journée complète." });
     }
@@ -183,7 +202,7 @@ app.post('/api/requests', async (req, res) => {
   }
 });
 
-// Liste filtrée (admin)
+// --- Liste filtrée (admin) ---
 app.get('/api/requests', requireAuth, (req, res) => {
   const status = (req.query.status || '').trim();
   let items = REQUESTS;
@@ -191,7 +210,7 @@ app.get('/api/requests', requireAuth, (req, res) => {
   res.json({ items });
 });
 
-// Validation (admin) + envoi mail à N+1, RH, CC Reine + Chrystelle
+// --- Validation (admin) + envoi mail à N+1, RH, CC Reine + Chrystelle ---
 app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   try {
     const rec = REQUESTS.find(r => r.id === req.params.id);
@@ -238,7 +257,7 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   }
 });
 
-// Refus (admin) — mail au demandeur
+// --- Refus (admin) — mail au demandeur ---
 app.post('/api/requests/:id/refuse', requireAuth, async (req, res) => {
   try {
     const rec = REQUESTS.find(r => r.id === req.params.id);
@@ -276,7 +295,7 @@ app.post('/api/requests/:id/refuse', requireAuth, async (req, res) => {
   }
 });
 
-// Annulation (admin) — mail au demandeur
+// --- Annulation (admin) — mail au demandeur ---
 app.post('/api/requests/:id/cancel', requireAuth, async (req, res) => {
   try {
     const rec = REQUESTS.find(r => r.id === req.params.id);
