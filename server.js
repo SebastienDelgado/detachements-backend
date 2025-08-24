@@ -1,5 +1,5 @@
 // server.js — backend complet (recette, stockage en mémoire)
-// Routes consommées par le front :
+// Routes utilisées par le front :
 //  - GET    /api/health
 //  - POST   /api/auth/login
 //  - POST   /api/requests
@@ -16,18 +16,21 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ---------- Utilitaires ----------
+/* ===================== Utils ===================== */
 function normalizeEmail(s) {
-  // Supprime les espaces Unicode "invisibles" + trim
+  // Supprime caractères de contrôle + espaces Unicode invisibles (Word/Outlook, ZWJ/ZWNJ, FEFF, etc.)
   return (s || '')
-    .replace(/[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/g, '')
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200D\u202F\u205F\u3000\uFEFF]/g, '')
     .trim();
 }
+
 function isEmail(s) {
-  // Regex plus permissive (accepte +, ', etc.)
+  // Regex permissive (RFC-like) : accepte +, ', _, -, .
   const re = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
   return re.test((s || '').trim());
 }
+
 function toFR(dateStr) {
   try {
     if (!dateStr) return '—';
@@ -37,6 +40,7 @@ function toFR(dateStr) {
     return dateStr || '—';
   }
 }
+
 function computeDays(dFrom, dTo, startP, endP) {
   if (!dFrom) return 0;
   if (!dTo) dTo = dFrom;
@@ -59,17 +63,19 @@ function computeDays(dFrom, dTo, startP, endP) {
   if (endP   === "AM") total -= 0.5;
   return total;
 }
+
 function fmtDaysFR(n) {
   if (n === undefined || n === null) return '—';
   const s = (n % 1 === 0.5) ? (Math.floor(n) + ",5") : String(n);
   return `${s} jour${n > 1 ? 's' : ''}`;
 }
+
 function uid() {
   if (global.crypto?.randomUUID) return global.crypto.randomUUID();
   return require('crypto').randomUUID();
 }
 
-// ---------- Config Admin / Mail ----------
+/* ===================== Admin & Mail ===================== */
 const ADMIN_EMAIL    = (process.env.ADMIN_EMAIL || '').trim();
 const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || '').trim();
 const ADMIN_TOKEN    = process.env.ADMIN_TOKEN || 'detachements-demo-token';
@@ -86,21 +92,26 @@ const transporter = nodemailer.createTransport({
 const MAIL_FROM      = process.env.MAIL_FROM      || 'test@example.com';
 const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Sébastien DELGADO';
 
-// ---------- Middleware ----------
+/* ===================== Middleware ===================== */
 app.use(cors({
   origin: (origin, cb) => {
-    // Autorise explicitement les origines listées (séparées par des virgules)
-    const allowed = (process.env.CORS_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
+    // Autorise explicitement les origines listées (séparées par des virgules).
+    const allowed = (process.env.CORS_ORIGINS || '')
+      .split(',')
+      .map(o => o.trim())
+      .filter(Boolean);
     if (!origin || allowed.length === 0 || allowed.includes(origin)) cb(null, true);
     else cb(new Error('Not allowed by CORS'));
   }
 }));
 app.use(express.json());
 
-// ---------- Stockage en mémoire (recette) ----------
+/* ===================== Stockage (mémoire) ===================== */
+// NOTE: en recette, la mémoire est perdue si Render redémarre.
+// Le front V4.7.2 met en cache l'historique côté navigateur pour éviter "perte visuelle".
 const REQUESTS = [];
 
-// ---------- Routes ----------
+/* ===================== Routes ===================== */
 app.get('/', (req, res) => {
   res.type('html').send(`
     <h1>Détachements API</h1>
@@ -141,7 +152,7 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// --- Création d'une demande (publique) ---
+/* ---- Création d'une demande (publique) ---- */
 app.post('/api/requests', async (req, res) => {
   try {
     let {
@@ -150,6 +161,7 @@ app.post('/api/requests', async (req, res) => {
       place, type, managerEmail, hrEmail, comment
     } = req.body || {};
 
+    // Nettoyage e-mails AVANT tests
     applicantEmail = normalizeEmail(applicantEmail);
     managerEmail   = normalizeEmail(managerEmail);
     hrEmail        = normalizeEmail(hrEmail);
@@ -164,7 +176,7 @@ app.post('/api/requests', async (req, res) => {
 
     if (!dateTo) dateTo = dateFrom;
 
-    // Cohérence périodes sur une seule journée
+    // Cohérence périodes sur une même journée
     if (dateFrom === dateTo && startPeriod === "PM" && endPeriod === "AM") {
       return res.status(400).json({ error: "Pour une même journée, choisissez Matin puis Après-midi, ou Journée complète." });
     }
@@ -202,7 +214,7 @@ app.post('/api/requests', async (req, res) => {
   }
 });
 
-// --- Liste filtrée (admin) ---
+/* ---- Liste filtrée (admin) ---- */
 app.get('/api/requests', requireAuth, (req, res) => {
   const status = (req.query.status || '').trim();
   let items = REQUESTS;
@@ -210,7 +222,7 @@ app.get('/api/requests', requireAuth, (req, res) => {
   res.json({ items });
 });
 
-// --- Validation (admin) + envoi mail à N+1, RH, CC Reine + Chrystelle ---
+/* ---- Validation (admin) + e-mail N+1/RH (+ Cc) ---- */
 app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   try {
     const rec = REQUESTS.find(r => r.id === req.params.id);
@@ -257,7 +269,7 @@ app.post('/api/requests/:id/validate', requireAuth, async (req, res) => {
   }
 });
 
-// --- Refus (admin) — mail au demandeur ---
+/* ---- Refus (admin) — e-mail au demandeur ---- */
 app.post('/api/requests/:id/refuse', requireAuth, async (req, res) => {
   try {
     const rec = REQUESTS.find(r => r.id === req.params.id);
@@ -295,7 +307,7 @@ app.post('/api/requests/:id/refuse', requireAuth, async (req, res) => {
   }
 });
 
-// --- Annulation (admin) — mail au demandeur ---
+/* ---- Annulation (admin) — e-mail au demandeur ---- */
 app.post('/api/requests/:id/cancel', requireAuth, async (req, res) => {
   try {
     const rec = REQUESTS.find(r => r.id === req.params.id);
@@ -333,7 +345,7 @@ app.post('/api/requests/:id/cancel', requireAuth, async (req, res) => {
   }
 });
 
-// ---------- Lancement ----------
+/* ===================== Lancement ===================== */
 app.listen(PORT, () => {
   console.log(`✅ API running on port ${PORT}`);
 });
