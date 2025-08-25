@@ -1,17 +1,13 @@
-# Détachements Backend
+# Détachements Backend – PostgreSQL (Render)
 
-Backend Express pour l'application de demandes de détachements CSEC.
+## Variables d’environnement
+- DATABASE_URL (Render Postgres)
+- DATABASE_SSL = true
+- CORS_ORIGINS = https://ton-site-netlify
+- ADMIN_EMAIL, ADMIN_PASSWORD
+- SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+- MAIL_FROM, MAIL_FROM_NAME
 
-## Routes
-
-- `/` : Page d'accueil simple
-- `/api/health` : Vérification de l'état (retourne `{ ok: true }`)
-
-## Lancement local
-
-```bash
+## Démarrage local
 npm install
 npm start
-```
-
-Puis ouvrir http://localhost:10000/api/health
