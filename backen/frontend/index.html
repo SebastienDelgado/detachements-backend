@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Détachements CGT SG - Art. 21 CSEC SG</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+  <script type="text/babel">
+    const API_BASE = "https://detachements-backend-sb26.onrender.com"; // ← Remplace par l'URL Render de TON backend si elle change
+    const LOGO_CGT = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='60'><rect width='180' height='60' fill='%23eee'/><text x='10' y='38' font-family='Arial' font-size='16' fill='%23000'>Logo CGT SG</text></svg>";
+    const LOGO_CSEC = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='60'><rect width='180' height='60' fill='%23eee'/><text x='10' y='38' font-family='Arial' font-size='16' fill='%23000'>Logo CSEC SG</text></svg>";
+
+    const { useState, useMemo, useEffect } = React;
+    const BTN_PRIMARY="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold bg-[#D71620] text-white hover:brightness-95";
+    const BTN_SECONDARY="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold bg-white text-gray-900 border border-gray-300 hover:bg-gray-50";
+    const INPUT="mt-1 w-full border border-gray-300 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-200 focus:border-red-300";
+    const SELECT="mt-1 w-full border border-gray-300 rounded-xl px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-red-200 focus:border-red-300";
+    const LABEL="block text-sm font-medium text-gray-800";
+    const SECTION="bg-white rounded-xl border shadow-sm p-6";
+    const SECTION_BORDER={borderColor:"#575757", borderWidth:"1px"};
+
+    function buildUrl(p){ return API_BASE.replace(/\/$/,'') + p; }
+    function cleanEmail(s){ return (s||"").replace(/[\u0000-\u001F\u007F-\u009F]/g,'').replace(/[\u00A0\u1680\u2000-\u200D\u202F\u205F\u3000\uFEFF]/g,'').trim(); }
+    function isEmail(s){ const x=cleanEmail(s); const re=/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/; return re.test(x); }
+    function computeDays(dFrom,dTo,sp,ep){
+      if(!dFrom) return 0;
+      if(!dTo) dTo=dFrom;
+      const from=new Date(dFrom+"T00:00:00Z"); const to=new Date(dTo+"T00:00:00Z");
+      if(isNaN(from)||isNaN(to)) return 0;
+      const base=Math.floor((to-from)/(24*3600*1000))+1;
+      sp=(sp||"FULL").toUpperCase(); ep=(ep||"FULL").toUpperCase();
+      if(dFrom===dTo){ if(sp==="FULL"||ep==="FULL") return 1; if(sp==="AM"&&ep==="PM") return 1; if(sp==="AM"&&ep==="AM") return 0.5; if(sp==="PM"&&ep==="PM") return 0.5; return 1; }
+      let t=base; if(sp==="PM") t-=0.5; if(ep==="AM") t-=0.5; return t;
+    }
+    function fmtDays(n){ if(n===undefined||n===null) return "—"; const s=(n%1===0.5)?(Math.floor(n)+",5"):String(n); return s+" jour"+(n>1?"s":""); }
+    function toFR(d){ if(!d||!/\d{4}-\d{2}-\d{2}/.test(d)) return d||"—"; const [y,m,dd]=d.split("-"); return `${dd}/${m}/${y}`; }
+    function fmtDateRangeFR(a,b,sp,ep){ if(!a&&!b)return "—"; const A=toFR(a||b); if(!b||a===b){ let p=sp&&sp!=="FULL"?(sp==="AM"?" (Matin)":" (Après-midi)"):""; return A+p; } const B=toFR(b); let tail=""; if(sp==="PM")tail+=" (Début: Après-midi)"; if(ep==="AM")tail+=(tail?", ":" ")+"(Fin: Matin)"; return A+" → "+B+tail; }
+
+    function App(){
+      const [tab,setTab]=useState("form");
+      const [health,setHealth]=useState(null);
+      useEffect(()=>{ fetch(buildUrl("/api/health")).then(r=>r.ok?r.json():Promise.reject()).then(()=>setHealth(true)).catch(()=>setHealth(false)); },[]);
+      return (
+        <div className="max-w-5xl mx-auto">
+          <div className="sticky top-0 z-10 backdrop-blur bg-white/70 border-b border-gray-100">
+            <div className="max-w-5xl mx-auto px-4 py-3 grid grid-cols-3 items-center">
+              <div><img src={LOGO_CGT} alt="CGT SG" className="h-10 w-auto object-contain" /></div>
+              <div className="text-center">
+                <h1 className="text-lg font-semibold">Détachements CGT SG – Art. 21 CSEC SG</h1>
+                <div className="text-xs mt-1">
+                  {health===true && <span className="inline-flex items-center border rounded-full px-2 py-1 text-green-700 border-green-200 bg-green-50">API OK</span>}
+                  {health===false && <span className="inline-flex items-center border rounded-full px-2 py-1 text-red-700 border-red-200 bg-red-50">API KO</span>}
+                </div>
+              </div>
+              <div className="flex justify-end"><img src={LOGO_CSEC} alt="CSEC SG" className="h-10 w-auto object-contain" /></div>
+            </div>
+          </div>
+
+          <div className="px-4 mt-4">
+            <div className="bg-white rounded-xl border p-4 text-sm leading-6" style={SECTION_BORDER}>
+              Cette web app est destinée à recueillir vos demandes de détachements en Article 21 de l'accord de fonctionnement du CSEC SG. Merci de saisir uniquement les dates de votre détachement hors délai de route.
+            </div>
+          </div>
+
+          <div className="px-4 py-4 flex items-center gap-3">
+            <button className={BTN_PRIMARY} onClick={()=>setTab('form')}>Formulaire de demande</button>
+            <div className="ml-auto"></div>
+            <button className={BTN_SECONDARY} onClick={()=>setTab('admin')}>Espace validation</button>
+          </div>
+
+          {tab==='form' ? <FormPage/> : <AdminPage/>}
+        </div>
+      );
+    }
+
+    function FormPage(){
+      const [lastName,setLastName]=useState("");
+      const [firstName,setFirstName]=useState("");
+      const [applicantEmail,setApplicantEmail]=useState("");
+      const [entity,setEntity]=useState("");
+
+      const [dateFrom,setDateFrom]=useState("");
+      const [dateTo,setDateTo]=useState("");
+      const [startPeriod,setStartPeriod]=useState("FULL");
+      const [endPeriod,setEndPeriod]=useState("FULL");
+      const [place,setPlace]=useState("");
+      const [type,setType]=useState("21B");
+      const [comment,setComment]=useState("");
+
+      const [managerEmail,setManagerEmail]=useState("");
+      const [hrEmail,setHrEmail]=useState("");
+
+      const [msg,setMsg]=useState("");
+      const [errors,setErrors]=useState({});
+      const [confirmOpen,setConfirmOpen]=useState(false);
+      const [confirmPayload,setConfirmPayload]=useState(null);
+
+      const ENTITIES=["SG AURA","SG Grand Ouest","SG Sud Ouest","SG Courtois Occitane","SG SMC et Corse","SG Tarneaud","SG Grand EST","SG Ile de France nord","SG Ile de France Sud","SG CDN","SG Laydernier","Service Centraux parisien","SGSS Nantes","GTPS"];
+
+      const liveDays=useMemo(()=>computeDays(dateFrom,dateTo,startPeriod,endPeriod),[dateFrom,dateTo,startPeriod,endPeriod]);
+
+      function validateForm(){
+        const e={}, t=s=>(s||"").trim();
+        if(!t(lastName)) e.lastName="Indiquez le nom.";
+        if(!t(firstName)) e.firstName="Indiquez le prénom.";
+        const ae=cleanEmail(applicantEmail); if(!isEmail(ae)) e.applicantEmail="Adresse e-mail du demandeur invalide.";
+        if(!entity) e.entity="Sélectionnez une entité.";
+        if(!dateFrom) e.dateFrom="Choisissez la date de début.";
+        if(dateTo && dateTo<dateFrom) e.dateTo="La date de fin doit être après la date de début.";
+        if(dateFrom && dateTo && dateFrom===dateTo && startPeriod==="PM" && endPeriod==="AM") e.dateTo="Pour une même journée, choisissez Matin puis Après-midi, ou Journée complète.";
+        if(!t(place)) e.place="Indiquez le lieu.";
+        const me=cleanEmail(managerEmail), he=cleanEmail(hrEmail);
+        if(!isEmail(me)) e.managerEmail="E-mail N+1 invalide.";
+        if(!isEmail(he)) e.hrEmail="E-mail DDRH/RH invalide.";
+        setErrors(e);
+        return Object.keys(e).length===0;
+      }
+
+      function openConfirm(ev){
+        ev.preventDefault();
+        setMsg("");
+        if(!validateForm()){ setMsg("❌ Corrigez les champs en rouge."); return; }
+        const payload={
+          fullName:(firstName.trim()+" "+lastName.trim()).trim(),
+          applicantEmail:cleanEmail(applicantEmail),
+          entity,
+          dateFrom, dateTo: dateTo || dateFrom,
+          startPeriod, endPeriod, place: place.trim(), type,
+          managerEmail: cleanEmail(managerEmail), hrEmail: cleanEmail(hrEmail),
+          comment: comment.trim(),
+          days: computeDays(dateFrom, dateTo || dateFrom, startPeriod, endPeriod)
+        };
+        setConfirmPayload(payload);
+        setConfirmOpen(true);
+      }
+
+      async function reallySubmit(){
+        try{
+          const r=await fetch(buildUrl("/api/requests"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(confirmPayload)});
+          const text=await r.text(); let d=null; try{ d=JSON.parse(text); }catch(_ ){}
+          if(!r.ok) throw new Error((d&&(d.error||d.message)) || text || "Erreur");
+          setMsg("Demande enregistrée ✅");
+          setLastName(""); setFirstName(""); setApplicantEmail(""); setEntity("");
+          setDateFrom(""); setDateTo(""); setStartPeriod("FULL"); setEndPeriod("FULL"); setPlace("");
+          setType("21B"); setComment(""); setManagerEmail(""); setHrEmail(""); setErrors({});
+        }catch(e){
+          setMsg("❌ "+(e.message || String(e)));
+        }finally{
+          setConfirmOpen(false);
+          setConfirmPayload(null);
+        }
+      }
+
+      return (
+        <form onSubmit={openConfirm} className="px-4 pb-16 space-y-6">
+          <section className={SECTION} style={SECTION_BORDER}>
+            <h2 className="font-bold text-gray-900 flex items-center gap-2"><span className="w-1.5 h-5 bg-[#D71620] rounded"></span> Le demandeur</h2>
+            <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className={LABEL}>Nom</label>
+                <input className={INPUT + (errors.lastName?" border-red-400 ring-red-200":"")} value={lastName} onChange={e=>setLastName(e.target.value)} />
+                {errors.lastName && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.lastName}</div>}
+              </div>
+              <div>
+                <label className={LABEL}>Prénom</label>
+                <input className={INPUT + (errors.firstName?" border-red-400 ring-red-200":"")} value={firstName} onChange={e=>setFirstName(e.target.value)} />
+                {errors.firstName && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.firstName}</div>}
+              </div>
+              <div className="sm:col-span-2">
+                <label className={LABEL}>Adresse e-mail du demandeur</label>
+                <input type="text" className={INPUT + (errors.applicantEmail?" border-red-400 ring-red-200":"")} placeholder="prenom.nom@exemple.com" value={applicantEmail} onChange={e=>setApplicantEmail(e.target.value)} />
+                {errors.applicantEmail && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.applicantEmail}</div>}
+              </div>
+              <div className="sm:col-span-2">
+                <label className={LABEL}>Entité</label>
+                <select className={SELECT + (errors.entity?" border-red-400 ring-red-200":"")} value={entity} onChange={e=>setEntity(e.target.value)}>
+                  <option value="">Sélectionner…</option>
+                  <option>SG AURA</option><option>SG Grand Ouest</option><option>SG Sud Ouest</option><option>SG Courtois Occitane</option><option>SG SMC et Corse</option><option>SG Tarneaud</option><option>SG Grand EST</option><option>SG Ile de France nord</option><option>SG Ile de France Sud</option><option>SG CDN</option><option>SG Laydernier</option><option>Service Centraux parisien</option><option>SGSS Nantes</option><option>GTPS</option>
+                </select>
+                {errors.entity && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.entity}</div>}
+              </div>
+            </div>
+          </section>
+
+          <section className={SECTION} style={SECTION_BORDER}>
+            <h2 className="font-bold text-gray-900 flex items-center gap-2"><span className="w-1.5 h-5 bg-[#D71620] rounded"></span> Le détachement</h2>
+            <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="bg-white border border-gray-200 rounded-xl p-4">
+                <div className="block text-sm font-medium text-gray-800 mb-1">Date de début</div>
+                <input type="date" className={INPUT + (errors.dateFrom?" border-red-400 ring-red-200":"")} value={dateFrom} onChange={e=>setDateFrom(e.target.value)} />
+                <select className={SELECT + " mt-2"} value={startPeriod} onChange={e=>setStartPeriod(e.target.value)}>
+                  <option value="FULL">Journée complète</option>
+                  <option value="AM">Matin</option>
+                  <option value="PM">Après-midi</option>
+                </select>
+                {errors.dateFrom && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.dateFrom}</div>}
+              </div>
+              <div className="bg-white border border-gray-200 rounded-xl p-4">
+                <div className="block text-sm font-medium text-gray-800 mb-1">Date de fin (optionnel)</div>
+                <input type="date" className={INPUT + (errors.dateTo?" border-red-400 ring-red-200":"")} value={dateTo} onChange={e=>setDateTo(e.target.value)} />
+                <select className={SELECT + " mt-2"} value={endPeriod} onChange={e=>setEndPeriod(e.target.value)}>
+                  <option value="FULL">Journée complète</option>
+                  <option value="AM">Matin</option>
+                  <option value="PM">Après-midi</option>
+                </select>
+                {errors.dateTo && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.dateTo}</div>}
+              </div>
+            </div>
+            <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="sm:col-span-2">
+                <label className={LABEL}>Lieu</label>
+                <input className={INPUT + (errors.place?" border-red-400 ring-red-200":"")} value={place} onChange={e=>setPlace(e.target.value)} />
+                {errors.place && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.place}</div>}
+              </div>
+              <div>
+                <label className={LABEL}>Type (Article 21)</label>
+                <select className={SELECT} value={type} onChange={e=>setType(e.target.value)}>
+                  <option value="21B">21B</option>
+                  <option value="21C">21C</option>
+                  <option value="Pour Information">Pour Information</option>
+                </select>
+              </div>
+            </div>
+            <div className="mt-3 inline-flex items-center gap-2 border rounded-full px-3 py-1 text-sm" style={{borderColor:"#D71620", color:"#D71620", background:"rgba(215,22,32,.08)"}}>
+              Durée estimée : <strong className="ml-1">{fmtDays(useMemo(()=>computeDays(dateFrom,dateTo,startPeriod,endPeriod),[dateFrom,dateTo,startPeriod,endPeriod]))}</strong>
+            </div>
+            <div className="mt-4">
+              <label className={LABEL}>Commentaire (optionnel)</label>
+              <input type="text" className={INPUT} placeholder="Votre commentaire (facultatif)" value={comment} onChange={e=>setComment(e.target.value)} />
+            </div>
+          </section>
+
+          <section className={SECTION} style={SECTION_BORDER}>
+            <h2 className="font-bold text-gray-900 flex items-center gap-2"><span className="w-1.5 h-5 bg-[#D71620] rounded"></span> Contacts à informer</h2>
+            <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className={LABEL}>E-mail N+1</label>
+                <input type="text" className={INPUT + (errors.managerEmail?" border-red-400 ring-red-200":"")} value={managerEmail} onChange={e=>setManagerEmail(e.target.value)} />
+                {errors.managerEmail && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.managerEmail}</div>}
+              </div>
+              <div>
+                <label className={LABEL}>E-mail DDRH / RH</label>
+                <input type="text" className={INPUT + (errors.hrEmail?" border-red-400 ring-red-200":"")} value={hrEmail} onChange={e=>setHrEmail(e.target.value)} />
+                {errors.hrEmail && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{errors.hrEmail}</div>}
+              </div>
+            </div>
+          </section>
+
+          <div className="flex items-center gap-3">
+            <button className={BTN_PRIMARY} type="submit">Envoyer la demande</button>
+            {msg && <div className={(msg.startsWith("❌") ? "text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2" : "text-sm text-green-700 bg-green-50 border border-green-200 rounded-xl px-3 py-2")}>{msg}</div>}
+          </div>
+
+          {confirmOpen && confirmPayload && (
+            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+              <div className="bg-white w-full max-w-2xl rounded-2xl shadow-xl overflow-hidden">
+                <div className="px-6 py-4 border-b flex items-center justify-between">
+                  <h3 className="text-lg font-semibold">Récapitulatif de votre demande</h3>
+                  <button onClick={()=>setConfirmOpen(false)} className="px-3 py-1 rounded-lg border">Fermer</button>
+                </div>
+                <div className="p-6 space-y-4 text-sm">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div><div className="text-gray-500">Nom & Prénom</div><div className="font-medium">{confirmPayload.fullName}</div></div>
+                    <div><div className="text-gray-500">E-mail demandeur</div><div className="font-medium">{confirmPayload.applicantEmail}</div></div>
+                    <div><div className="text-gray-500">Entité</div><div className="font-medium">{confirmPayload.entity}</div></div>
+                    <div><div className="text-gray-500">Lieu</div><div className="font-medium">{confirmPayload.place}</div></div>
+                    <div><div className="text-gray-500">Dates</div><div className="font-medium">{fmtDateRangeFR(confirmPayload.dateFrom,confirmPayload.dateTo,confirmPayload.startPeriod,confirmPayload.endPeriod)}</div></div>
+                    <div><div className="text-gray-500">Type</div><div className="font-medium">{confirmPayload.type}</div></div>
+                    <div><div className="text-gray-500">Durée</div><div className="font-medium">{fmtDays(confirmPayload.days)}</div></div>
+                    <div><div className="text-gray-500">Commentaire</div><div className="font-medium">{confirmPayload.comment||"—"}</div></div>
+                    <div><div className="text-gray-500">E-mail N+1</div><div className="font-medium">{confirmPayload.managerEmail}</div></div>
+                    <div><div className="text-gray-500">E-mail DDRH / RH</div><div className="font-medium">{confirmPayload.hrEmail}</div></div>
+                  </div>
+                  <div className="mt-4 flex items-center justify-end gap-3">
+                    <button className={BTN_SECONDARY} onClick={()=>setConfirmOpen(false)}>Modifier</button>
+                    <button className={BTN_PRIMARY} onClick={reallySubmit}>Confirmer l’envoi</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </form>
+      );
+    }
+
+    function AdminPage(){
+      const [email,setEmail]=useState("");
+      const [password,setPassword]=useState("");
+      const [token,setToken]=useState("");
+      const [err,setErr]=useState("");
+
+      async function login(e){
+        e.preventDefault(); setErr("");
+        try{
+          const r=await fetch(buildUrl("/api/auth/login"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:(email||'').trim().replace(/\s+/g,''),password})});
+          const t=await r.text(); let d=null; try{d=JSON.parse(t);}catch(_ ){}
+          if(!r.ok) throw new Error((d&&(d.error||d.message)) || t || "Erreur");
+          setToken(d.token);
+        }catch(ex){ setErr(ex.message||String(ex)); }
+      }
+
+      if(!token){
+        return (
+          <div className="px-4 pb-16">
+            <section className="bg-white rounded-xl border p-6 max-w-md mx-auto" style={SECTION_BORDER}>
+              <h2 className="font-bold text-gray-900 flex items-center gap-2"><span className="w-1.5 h-5 bg-[#D71620] rounded"></span> Connexion à l'espace de validation</h2>
+              <form onSubmit={login} className="mt-4 space-y-3">
+                <input type="text" className={INPUT} placeholder="Email admin" value={email} onChange={e=>setEmail(e.target.value)} />
+                <input type="password" className={INPUT} placeholder="Mot de passe" value={password} onChange={e=>setPassword(e.target.value)} />
+                {err && <div className="mt-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{err}</div>}
+                <button className={BTN_PRIMARY + " w-full mt-2"}>Se connecter</button>
+              </form>
+            </section>
+          </div>
+        );
+      }
+
+      return (
+        <div className="px-4 pb-16 space-y-6">
+          <AdminTables token={token} />
+        </div>
+      );
+    }
+
+    function AdminTables({token}){
+      return (<>
+        <RequestsTable token={token} title="Demandes en attente" status="pending" showActions />
+        <RequestsTable token={token} title="Historique (envoyées)" status="sent" />
+        <RequestsTable token={token} title="Refusées / Annulées" status="refused_cancelled" />
+      </>);
+    }
+
+    function RequestsTable({token, title, status, showActions}){
+      const [rows,setRows]=useState([]);
+      const [error,setError]=useState("");
+      const [previewOpen,setPreviewOpen]=useState(false);
+      const [previewRec,setPreviewRec]=useState(null);
+      const BTN_P=BTN_PRIMARY, BTN_S=BTN_SECONDARY;
+
+      function readError(r){ return r.text().then(t=>{ try{const j=JSON.parse(t); return j.error||j.message||t;}catch(_ ){return t||"Erreur";} }); }
+      function refresh(){ 
+        const headers={Authorization:"Bearer "+token};
+        let url="/api/requests?status="+(status==="refused_cancelled"?"refused":status);
+        fetch(buildUrl(url),{headers}).then(r=>r.ok?r.json():readError(r).then(e=>Promise.reject(e))).then(d=>{
+          let items=d.items||[];
+          if(status==="refused_cancelled"){
+            fetch(buildUrl("/api/requests?status=cancelled"),{headers}).then(r=>r.ok?r.json():{items:[]}).then(d2=>{
+              setRows(items.concat(d2.items||[]));
+            });
+          } else setRows(items);
+        }).catch(e=>setError(String(e)));
+      }
+
+      React.useEffect(()=>{ refresh(); }, [token, status]);
+
+      function fmtDays(n){ if(n===undefined||n===null)return "—"; const s=(n%1===0.5)?(Math.floor(n)+",5"):String(n); return s+" jour"+(n>1?"s":""); }
+      function toFR(d){ if(!d||!/\d{4}-\d{2}-\d{2}/.test(d)) return d||"—"; const [y,m,dd]=d.split("-"); return `${dd}/${m}/${y}`; }
+
+      async function doValidate(id){
+        try{
+          const r=await fetch(buildUrl("/api/requests/"+id+"/validate"),{method:"POST",headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"}});
+          if(!r.ok) throw new Error(await readError(r));
+          await r.json().catch(()=>null); setPreviewOpen(false); setPreviewRec(null); refresh();
+        }catch(ex){ alert("❌ "+(ex.message||String(ex))); }
+      }
+      async function doRefuseOrCancel(id, kind){
+        const motif=prompt(kind==='refuse'?"Motif du refus:":"Motif de l'annulation:");
+        if(motif===null) return;
+        try{
+          const r=await fetch(buildUrl("/api/requests/"+id+(kind==='refuse'?"/refuse":"/cancel")),{method:"POST",headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"},body:JSON.stringify({reason: motif})});
+          if(!r.ok) throw new Error(await readError(r));
+          await r.json().catch(()=>null); alert("✅ "+(kind==='refuse'?"Refus":"Annulation")+" notifié(e)"); refresh();
+        }catch(ex){ alert("❌ "+(ex.message||String(ex))); }
+      }
+
+      return (
+        <section className="bg-white rounded-xl border p-6" style={{borderColor:"#575757", borderWidth:"1px"}}>
+          <h2 className="font-bold text-gray-900 flex items-center gap-2"><span className="w-1.5 h-5 bg-[#D71620] rounded"></span> {title}</h2>
+          <div className="mt-3 overflow-auto">
+            <table className="w-full border-collapse">
+              <thead className="bg-gray-50">
+                <tr className="text-left">
+                  <th className="p-2 text-sm font-semibold text-gray-700">Prénom & Nom</th>
+                  <th className="p-2 text-sm font-semibold text-gray-700">E-mail</th>
+                  <th className="p-2 text-sm font-semibold text-gray-700">Entité</th>
+                  <th className="p-2 text-sm font-semibold text-gray-700">Dates</th>
+                  <th className="p-2 text-sm font-semibold text-gray-700">Lieu</th>
+                  <th className="p-2 text-sm font-semibold text-gray-700">Article 21</th>
+                  <th className="p-2 text-sm font-semibold text-gray-700">Nb jours</th>
+                  <th className="p-2 text-sm font-semibold text-gray-700">Commentaire</th>
+                  {showActions && <th className="p-2 text-sm font-semibold text-gray-700">Actions</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.length>0 ? rows.map(r=>(
+                  <tr key={r.id} className="border-b">
+                    <td className="p-2">{r.full_name}</td>
+                    <td className="p-2">{r.applicant_email||"—"}</td>
+                    <td className="p-2">{r.entity}</td>
+                    <td className="p-2">{(r.date_from===r.date_to||!r.date_to)?toFR(r.date_from):toFR(r.date_from)+" → "+toFR(r.date_to)}</td>
+                    <td className="p-2">{r.place}</td>
+                    <td className="p-2">{r.type}</td>
+                    <td className="p-2">{fmtDays(r.days)}</td>
+                    <td className="p-2">{r.comment||"—"}</td>
+                    {showActions && <td className="p-2">
+                      <div className="flex items-center gap-2">
+                        <button className={BTN_P} onClick={()=>{setPreviewRec(r); setPreviewOpen(true);}}>Valider</button>
+                        <button className={BTN_S} onClick={()=>doRefuseOrCancel(r.id,'refuse')}>Refuser</button>
+                        <button className={BTN_S} onClick={()=>doRefuseOrCancel(r.id,'cancel')}>Annuler</button>
+                      </div>
+                    </td>}
+                  </tr>
+                )) : (
+                  <tr><td colSpan={showActions?9:8} className="p-2 text-gray-500">Aucune donnée</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {previewOpen && previewRec && (
+            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+              <div className="bg-white w-full max-w-3xl rounded-2xl shadow-xl overflow-hidden">
+                <div className="px-6 py-4 border-b flex items-center justify-between">
+                  <h3 className="text-lg font-semibold">Aperçu de l'e-mail de validation</h3>
+                  <button onClick={()=>setPreviewOpen(false)} className="px-3 py-1 rounded-lg border">Fermer</button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div className="text-sm">
+                    <div className="mb-2"><span className="text-gray-500">Objet</span><div className="font-medium">Détachement – {previewRec.full_name}</div></div>
+                    <div className="mb-2"><span className="text-gray-500">À</span>
+                      <div className="font-medium">
+                        {[previewRec.manager_email,previewRec.hr_email,"reine.allaglo@csec-sg.com","chrystelle.agea@socgen.com"].filter(Boolean).join(", ")}
+                      </div>
+                    </div>
+                    <div className="mb-2"><span className="text-gray-500">Cc</span>
+                      <div className="font-medium">
+                        {["sebastien.delgado@csec-sg.com","ludivine.perreaut@gmail.com",previewRec.applicant_email].filter(Boolean).join(", ")}
+                      </div>
+                    </div>
+                    <div className="border rounded-xl p-4 bg-gray-50" style={{fontFamily:"Arial, sans-serif", fontSize:"12pt", color:"#000"}}>
+                      <p>Bonjour,</p>
+                      <p>Merci de bien vouloir noter le détachement de :<br/><span style={{color:"#D71620"}}>{previewRec.full_name}{previewRec.entity?' – '+previewRec.entity:''}</span></p>
+                      <p>Le(s) : <span style={{color:"#D71620"}}>{(previewRec.date_from===previewRec.date_to||!previewRec.date_to)?toFR(previewRec.date_from):(toFR(previewRec.date_from)+" au "+toFR(previewRec.date_to))}</span><br/>À : <span style={{color:"#D71620"}}>{previewRec.place}</span><br/>En article 21 : <span style={{color:"#D71620"}}>{previewRec.type} – {fmtDays(previewRec.days)}</span><br/>(Hors délai de route)</p>
+                      {previewRec.comment?<p>Commentaire du demandeur : <span style={{color:"#D71620"}}>{previewRec.comment}</span></p>:null}
+                      <p>Bonne fin de journée,</p>
+                      <p><strong>Sébastien DELGADO</strong><br/>Secrétaire Adjoint – CSEC SG<br/>sebastien.delgado@csec-sg.com<br/>06 74 98 48 68</p>
+                      <p style={{marginTop:'8px'}}><strong>Ludivine PERREAUT</strong><br/>Responsable Syndicale Nationale CGT SG auprès du CSEC SG<br/>ludivine.perreaut@gmail.com<br/>06 82 83 84 84</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-end gap-3">
+                    <button onClick={()=>setPreviewOpen(false)} className={BTN_SECONDARY}>Annuler</button>
+                    <button onClick={()=>doValidate(previewRec.id)} className={BTN_PRIMARY}>Confirmer et envoyer</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
