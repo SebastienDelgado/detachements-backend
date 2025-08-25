@@ -1,10 +1,9 @@
-// server.js — Détachements CSEC SG (in-memory)
-// Fonctions : Auth, création/listing/validation/refus/annulation, envoi mails (Mailtrap par défaut)
-
+// server.js — Backend Postgres (Render) pour Détachements CSEC SG
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const { pool, ensureSchema } = require('./db');
 require('dotenv').config();
 
 const app = express();
@@ -92,14 +91,39 @@ function computeDays(dFrom, dTo, sp, ep) {
 }
 
 /* =========================
-   Storage en mémoire
+   Auth très simple (admin)
    ========================= */
-const DB = {
-  requests: new Map(), // id -> record
-  tokens: new Set(),   // jetons actifs
-};
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@example.com').toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'adminpass';
 
-// Normalisation et validation de payload côté serveur
+function authMiddleware(req, res, next) {
+  const hdr = req.headers.authorization || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
+  if (token && TOKENS.has(token)) return next();
+  return res.status(401).json({ error: 'Non autorisé' });
+}
+const TOKENS = new Set();
+
+app.post('/api/auth/login', (req, res) => {
+  const email = (req.body.email || '').toLowerCase().trim();
+  const password = req.body.password || '';
+  if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+    const token = crypto.randomBytes(24).toString('hex');
+    TOKENS.add(token);
+    return res.json({ token });
+  }
+  return res.status(401).json({ error: 'Identifiants invalides' });
+});
+
+/* =========================
+   Health
+   ========================= */
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+/* =========================
+   API demandes (Postgres)
+   ========================= */
+
 function normalizeRequestPayload(body) {
   const fullName = (body.fullName || body.full_name || '').toString().trim();
   const applicantEmail = mustBeEmail('E-mail demandeur', body.applicantEmail || body.applicant_email);
@@ -116,7 +140,6 @@ function normalizeRequestPayload(body) {
   const hrEmail = mustBeEmail('E-mail DDRH/RH', body.hrEmail || body.hr_email);
   const comment = (body.comment || '').toString().trim();
 
-  // Guard règles de date
   if (!dateFrom) throw new Error("Date de début manquante");
   if (dateTo && dateTo < dateFrom) throw new Error("La date de fin ne peut pas être antérieure à la date de début");
   if (dateFrom === dateTo && startPeriod === 'PM' && endPeriod === 'AM') {
@@ -142,82 +165,50 @@ function normalizeRequestPayload(body) {
   };
 }
 
-/* =========================
-   Auth très simple (admin)
-   ========================= */
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@example.com').toLowerCase();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'adminpass';
-
-function authMiddleware(req, res, next) {
-  const hdr = req.headers.authorization || '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-  if (token && DB.tokens.has(token)) return next();
-  return res.status(401).json({ error: 'Non autorisé' });
-}
-
-app.post('/api/auth/login', (req, res) => {
-  const email = (req.body.email || '').toLowerCase().trim();
-  const password = req.body.password || '';
-  if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-    const token = crypto.randomBytes(24).toString('hex');
-    DB.tokens.add(token);
-    return res.json({ token });
-  }
-  return res.status(401).json({ error: 'Identifiants invalides' });
-});
-
-/* =========================
-   Health
-   ========================= */
-app.get('/api/health', (req, res) => res.json({ ok: true }));
-
-/* =========================
-   API demandes (in-memory)
-   ========================= */
-
 // Création
-app.post('/api/requests', (req, res) => {
+app.post('/api/requests', async (req, res) => {
   try {
-    const payload = normalizeRequestPayload(req.body || {});
+    const p = normalizeRequestPayload(req.body || {});
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
-
-    const rec = {
-      id,
-      status: 'pending',
-      created_at: now,
-      validated_at: null,
-      decision_at: null,
-      decision_reason: null,
-      ...payload,
-    };
-
-    DB.requests.set(id, rec);
-    return res.json({ ok: true, id });
+    const q = `INSERT INTO requests
+      (id, full_name, applicant_email, entity, date_from, date_to, start_period, end_period, place, type, manager_email, hr_email, comment, days, status, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',NOW())
+      RETURNING id;`;
+    const vals = [id, p.full_name, p.applicant_email, p.entity, p.date_from, p.date_to, p.start_period, p.end_period, p.place, p.type, p.manager_email, p.hr_email, p.comment, p.days];
+    const r = await pool.query(q, vals);
+    return res.json({ ok: true, id: r.rows[0].id });
   } catch (err) {
+    console.error('POST /api/requests error:', err.message);
     return res.status(400).json({ error: err.message || 'Payload invalide' });
   }
 });
 
-// Listing par statut (admin uniquement)
-app.get('/api/requests', authMiddleware, (req, res) => {
-  const status = (req.query.status || '').toLowerCase();
-  const items = [];
-  for (const r of DB.requests.values()) {
-    if (!status || r.status === status) items.push(r);
+// Listing par statut (admin)
+app.get('/api/requests', authMiddleware, async (req, res) => {
+  try {
+    const status = (req.query.status || '').toLowerCase();
+    let sql = `SELECT * FROM requests`;
+    const args = [];
+    if (status) {
+      sql += ` WHERE status = $1`; args.push(status);
+    }
+    sql += ` ORDER BY created_at DESC`;
+    const r = await pool.query(sql, args);
+    return res.json({ items: r.rows });
+  } catch (err) {
+    console.error('GET /api/requests error:', err.message);
+    return res.status(500).json({ error: 'Liste indisponible' });
   }
-  // Tri du plus récent au plus ancien
-  items.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-  return res.json({ items });
 });
 
 // Validation + envoi mail
 app.post('/api/requests/:id/validate', authMiddleware, async (req, res) => {
   try {
-    const rec = DB.requests.get(req.params.id);
-    if (!rec) return res.status(404).json({ error: 'Demande introuvable' });
+    const { id } = req.params;
+    const r1 = await pool.query(`SELECT * FROM requests WHERE id=$1`, [id]);
+    if (!r1.rows.length) return res.status(404).json({ error: 'Demande introuvable' });
+    const rec = r1.rows[0];
 
-    // Règles destinataires
     const toList = [
       cleanEmail(rec.manager_email),
       cleanEmail(rec.hr_email),
@@ -262,24 +253,24 @@ app.post('/api/requests/:id/validate', authMiddleware, async (req, res) => {
       html
     });
 
-    rec.status = 'sent';
-    rec.validated_at = new Date().toISOString();
-    DB.requests.set(rec.id, rec);
-
-    return res.json({ ok: true, id: rec.id, to: toList, cc: ccList });
+    await pool.query(`UPDATE requests SET status='sent', validated_at=NOW() WHERE id=$1`, [id]);
+    return res.json({ ok: true, id, to: toList, cc: ccList });
   } catch (err) {
-    console.error('Erreur envoi validation:', err);
+    console.error('validate error:', err.message);
     return res.status(500).json({ error: 'Envoi email échoué' });
   }
 });
 
-// Refus (mail au demandeur, double signature)
+// Refus
 app.post('/api/requests/:id/refuse', authMiddleware, async (req, res) => {
   try {
-    const rec = DB.requests.get(req.params.id);
-    if (!rec) return res.status(404).json({ error: 'Demande introuvable' });
+    const { id } = req.params;
     const reason = (req.body && req.body.reason || '').toString().trim();
     if (!reason) return res.status(400).json({ error: 'Motif requis' });
+
+    const r1 = await pool.query(`SELECT * FROM requests WHERE id=$1`, [id]);
+    if (!r1.rows.length) return res.status(404).json({ error: 'Demande introuvable' });
+    const rec = r1.rows[0];
 
     const subject = "Refus de votre demande de détachement";
     const html = `
@@ -303,25 +294,24 @@ app.post('/api/requests/:id/refuse', authMiddleware, async (req, res) => {
       html
     });
 
-    rec.status = 'refused';
-    rec.decision_at = new Date().toISOString();
-    rec.decision_reason = reason;
-    DB.requests.set(rec.id, rec);
-
+    await pool.query(`UPDATE requests SET status='refused', decision_at=NOW(), decision_reason=$2 WHERE id=$1`, [id, reason]);
     return res.json({ ok: true });
   } catch (err) {
-    console.error('Erreur refus:', err);
+    console.error('refuse error:', err.message);
     return res.status(500).json({ error: 'Envoi email échoué' });
   }
 });
 
-// Annulation (mail au demandeur, double signature)
+// Annulation
 app.post('/api/requests/:id/cancel', authMiddleware, async (req, res) => {
   try {
-    const rec = DB.requests.get(req.params.id);
-    if (!rec) return res.status(404).json({ error: 'Demande introuvable' });
+    const { id } = req.params;
     const reason = (req.body && req.body.reason || '').toString().trim();
     if (!reason) return res.status(400).json({ error: 'Motif requis' });
+
+    const r1 = await pool.query(`SELECT * FROM requests WHERE id=$1`, [id]);
+    if (!r1.rows.length) return res.status(404).json({ error: 'Demande introuvable' });
+    const rec = r1.rows[0];
 
     const subject = "Annulation de votre demande de détachement";
     const html = `
@@ -345,14 +335,10 @@ app.post('/api/requests/:id/cancel', authMiddleware, async (req, res) => {
       html
     });
 
-    rec.status = 'cancelled';
-    rec.decision_at = new Date().toISOString();
-    rec.decision_reason = reason;
-    DB.requests.set(rec.id, rec);
-
+    await pool.query(`UPDATE requests SET status='cancelled', decision_at=NOW(), decision_reason=$2 WHERE id=$1`, [id, reason]);
     return res.json({ ok: true });
   } catch (err) {
-    console.error('Erreur annulation:', err);
+    console.error('cancel error:', err.message);
     return res.status(500).json({ error: 'Envoi email échoué' });
   }
 });
@@ -368,6 +354,11 @@ app.get('/', (req, res) => {
   `);
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ API running on port ${PORT}`);
+ensureSchema().then(() => {
+  app.listen(PORT, () => {
+    console.log(`✅ API running on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error('Erreur init schema:', err);
+  process.exit(1);
 });
