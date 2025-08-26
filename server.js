@@ -1,4 +1,4 @@
-// server.js — Backend (Mongo + JWT + Mailtrap)
+// server.js — Backend (Mongo + JWT + Mailtrap + Alertes + Relances)
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
@@ -11,11 +11,13 @@ const {
   PORT = 3000,
   MONGODB_URI,
   JWT_SECRET,
-  MAILTRAP_HOST,
+  // Mailtrap "Inbox Testing" par défaut (host smtp.mailtrap.io, port 2525)
+  MAILTRAP_HOST = 'smtp.mailtrap.io',
   MAILTRAP_PORT = 2525,
   MAILTRAP_USER,
   MAILTRAP_PASS,
   APP_BASE_URL = 'http://localhost:5173',
+  CRON_SECRET, // secret pour /internal/cron/reminders
 } = process.env;
 
 if (!MONGODB_URI || !JWT_SECRET) {
@@ -26,7 +28,7 @@ if (!MONGODB_URI || !JWT_SECRET) {
 // ----- App -----
 const app = express();
 
-// CORS universel (et OPTIONS)
+// CORS simple (gère aussi les OPTIONS)
 app.use((req, res, next) => {
   const origin = req.headers.origin || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
@@ -80,8 +82,10 @@ const RequestSchema = new mongoose.Schema({
   hr_email: String,
   status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
   created_at: { type: Date, default: () => new Date() },
-  reminder2_sent_at: Date,
-  reminder4_sent_at: Date,
+  reminder2_sent_at: Date, // J+2
+  reminder4_sent_at: Date, // J+4
+  refuse_reason: String,
+  cancel_reason: String,
 }, { timestamps: true });
 
 const Admin = mongoose.model('Admin', AdminSchema);
@@ -93,18 +97,27 @@ const transporter = nodemailer.createTransport({
   port: Number(MAILTRAP_PORT),
   auth: { user: MAILTRAP_USER, pass: MAILTRAP_PASS },
 });
+transporter.verify().then(
+  () => console.log('📮 Mailer ready (Mailtrap).'),
+  (e) => console.error('📮 Mailer verify failed:', e?.message || e)
+);
 async function sendMail({ to, cc = [], subject, html }) {
   return transporter.sendMail({
     from: '"CSEC SG - Détachements" <no-reply@csec-sg.com>',
     to: Array.isArray(to) ? to.join(', ') : to,
     cc: Array.isArray(cc) ? cc.join(', ') : cc,
-    subject, html,
+    subject,
+    html,
   });
 }
 
 // ----- Utils -----
 function signToken(admin) {
-  return jwt.sign({ sub: admin._id.toString(), name: admin.name, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign(
+    { sub: admin._id.toString(), name: admin.name, email: admin.email },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
 }
 async function authRequired(req, res, next) {
   const h = req.headers['authorization'] || '';
@@ -137,11 +150,17 @@ mongoose.connection.on('connected', async () => {
   const a1 = new Admin({ email: SEB_EMAIL, name: 'Sébastien DELGADO', passwordHash: await bcrypt.hash(SEB_PASS, 10) });
   const a2 = new Admin({ email: LUDI_EMAIL, name: 'Ludivine PERREAUT', passwordHash: await bcrypt.hash(LUDI_PASS, 10) });
   await a1.save(); await a2.save();
-  console.log('Admins seeded.');
+  console.log('👥 Admins seeded.');
 });
 
 // ----- Health -----
 app.get('/api/health', (req,res) => res.json({ ok: true }));
+
+// (Optionnel) test mail
+app.get('/api/mail-verify', async (req,res) => {
+  try { await transporter.verify(); res.json({ ok:true }); }
+  catch(e){ res.status(500).json({ ok:false, error: e.message }); }
+});
 
 // ----- Auth -----
 app.post('/api/auth/login', async (req,res) => {
@@ -164,10 +183,9 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
 });
 
 // ----- Requests -----
-// Création
+// Création : envoie une alerte aux admins
 app.post('/api/requests', async (req,res) => {
   const b = req.body || {};
-  // 🔧 ligne corrigée : 'days' à la fin
   const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
   for (const k of required) {
     if (!b[k]) return res.status(400).json({ error: `Champ manquant: ${k}` });
@@ -189,6 +207,27 @@ app.post('/api/requests', async (req,res) => {
     status: 'pending',
     created_at: new Date(),
   });
+
+  // Alerte e-mail aux admins (Mailtrap)
+  try {
+    const admins = await Admin.find({}).lean();
+    const adminEmails = admins.map(a => a.email);
+    const subject = `Nouvelle demande de détachement – ${rec.full_name}`;
+    const html = `
+      <p>Bonjour,</p>
+      <p>Nouvelle demande en attente :</p>
+      <ul>
+        <li><strong>${rec.full_name}</strong> (${rec.entity})</li>
+        <li>Dates : ${toFR(rec.date_from)} → ${toFR(rec.date_to)}</li>
+        <li>Lieu : ${rec.place}</li>
+        <li>Article 21 : ${rec.type} – ${rec.days} jour(s)</li>
+        <li>Commentaire : ${rec.comment || '—'}</li>
+      </ul>
+      <p>Accéder à l'espace validation : ${APP_BASE_URL}</p>
+    `;
+    await sendMail({ to: adminEmails, subject, html });
+  } catch(e){ console.error('Mail admins (création) err:', e?.message || e); }
+
   return res.json({ ok: true, id: rec._id.toString() });
 });
 
@@ -201,6 +240,7 @@ app.get('/api/requests', authRequired, async (req,res) => {
 });
 
 // ----- Actions : VALIDATE / REFUSE / CANCEL -----
+// Valider et envoyer l'e-mail signé par l'admin connecté
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -228,19 +268,13 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   try {
     const to = [rec.manager_email, rec.hr_email].filter(Boolean);
     const cc = [rec.applicant_email].filter(Boolean);
-    const transporter = nodemailer.createTransport({
-      host: MAILTRAP_HOST, port: Number(MAILTRAP_PORT),
-      auth: { user: MAILTRAP_USER, pass: MAILTRAP_PASS },
-    });
-    await transporter.sendMail({
-      from: '"CSEC SG - Détachements" <no-reply@csec-sg.com>',
-      to: to.join(', '), cc: cc.join(', '), subject, html
-    });
-  } catch(e){ console.error('Mail validate err:', e.message); }
+    await sendMail({ to, cc, subject, html });
+  } catch(e){ console.error('Mail validate err:', e?.message || e); }
 
   return res.json({ ok: true });
 });
 
+// Refuser
 app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -250,6 +284,7 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
+// Annuler
 app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -257,6 +292,64 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   rec.cancel_reason = (req.body && req.body.reason) || '';
   await rec.save();
   return res.json({ ok: true });
+});
+
+// ----- Cron: relances J+2 et J+4 -----
+// Crée un Cron Job Render qui appelle cette route chaque jour à 08:00 Europe/Paris.
+// Ajoute un secret ?token=XXX dans l’URL (même valeur que l’ENV CRON_SECRET).
+app.post('/internal/cron/reminders', async (req,res) => {
+  if (CRON_SECRET && req.query.token !== CRON_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const now = dayjs(); // UTC
+  const pending = await Request.find({ status: 'pending' });
+  const admins = await Admin.find({}).lean();
+  const adminEmails = admins.map(a => a.email);
+
+  let sent2 = 0, sent4 = 0;
+
+  for (const r of pending) {
+    const ageDays = now.diff(dayjs(r.created_at), 'day');
+
+    // J+2
+    if (ageDays >= 2 && !r.reminder2_sent_at) {
+      const subject = `Relance J+2 – Détachement en attente – ${r.full_name}`;
+      const html = `
+        <p>Relance J+2 — la demande suivante est toujours en attente :</p>
+        <ul>
+          <li>Demandeur : ${r.full_name} (${r.entity})</li>
+          <li>Dates : ${toFR(r.date_from)} → ${toFR(r.date_to)}</li>
+          <li>Lieu : ${r.place}</li>
+          <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
+        </ul>
+        <p>Espace validation : ${APP_BASE_URL}</p>
+      `;
+      try { await sendMail({ to: adminEmails, subject, html }); r.reminder2_sent_at = new Date(); sent2++; }
+      catch(e){ console.error('reminder J+2 mail err:', e?.message || e); }
+      await r.save();
+    }
+
+    // J+4
+    if (ageDays >= 4 && !r.reminder4_sent_at) {
+      const subject = `Relance J+4 – Détachement en attente – ${r.full_name}`;
+      const html = `
+        <p>Relance J+4 — la demande suivante est toujours en attente :</p>
+        <ul>
+          <li>Demandeur : ${r.full_name} (${r.entity})</li>
+          <li>Dates : ${toFR(r.date_from)} → ${toFR(r.date_to)}</li>
+          <li>Lieu : ${r.place}</li>
+          <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
+        </ul>
+        <p>Espace validation : ${APP_BASE_URL}</p>
+      `;
+      try { await sendMail({ to: adminEmails, subject, html }); r.reminder4_sent_at = new Date(); sent4++; }
+      catch(e){ console.error('reminder J+4 mail err:', e?.message || e); }
+      await r.save();
+    }
+  }
+
+  return res.json({ ok: true, sent2, sent4 });
 });
 
 // ----- Start -----
