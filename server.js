@@ -30,32 +30,24 @@ if (!MONGODB_URI || !JWT_SECRET) {
 const app = express();
 
 /**
- * CORS assoupli pour Netlify → Render
- * - origin: true → reflète l’origine (ou * si pas d’origine)
- * - on répond explicitement aux pré-vols OPTIONS pour toutes les routes
- * - on NE fixe PAS allowedHeaders: le middleware cors renvoie ceux demandés
+ * Middleware CORS global : répond à toutes les requêtes, y compris OPTIONS
  */
-const corsOptions = {
-  origin: true,
-  credentials: false,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));  // <— IMPORTANT pour les pré-vols
-
-// Logger simple des pré-vols (utile au debug)
 app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    console.log('CORS preflight → origin=%s method=%s headers=%s',
-      req.headers['origin'],
-      req.headers['access-control-request-method'],
-      req.headers['access-control-request-headers']
-    );
-  }
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    req.headers['access-control-request-headers'] || 'Content-Type, Authorization, Accept'
+  );
+  if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
 
+// Support JSON + x-www-form-urlencoded
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false }));
 
 // ====== DB ======
 mongoose.set('strictQuery', true);
@@ -157,8 +149,8 @@ async function seedAdmins() {
   // MDP initiaux (à changer après la 1ère connexion)
   const SEB_EMAIL = 'sebastien.delgado@csec-sg.com';
   const LUDI_EMAIL = 'ludivine.perreaut@gmail.com';
-  const SEB_PASS = 'SeB!24-9vQ@csec';     // ➜ à changer après login
-  const LUDI_PASS = 'LuD!24-7mX@csec';    // ➜ à changer après login
+  const SEB_PASS = 'SeB!24-9vQ@csec';
+  const LUDI_PASS = 'LuD!24-7mX@csec';
 
   const a1 = new Admin({
     email: SEB_EMAIL,
@@ -204,8 +196,6 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
 });
 
 // ====== Requests ======
-
-// Création : enregistre + mail d’alerte aux admins
 app.post('/api/requests', async (req,res) => {
   const b = req.body || {};
   const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
@@ -213,7 +203,6 @@ app.post('/api/requests', async (req,res) => {
     if (!b[k]) return res.status(400).json({ error: `Champ manquant: ${k}` });
   }
 
-  // Enregistrement
   const rec = await Request.create({
     full_name: b.fullName,
     applicant_email: b.applicantEmail,
@@ -232,10 +221,9 @@ app.post('/api/requests', async (req,res) => {
     created_at: new Date(),
   });
 
-  // Réponse immédiate (UX) — l’email part en arrière-plan
   res.json({ ok: true, id: rec._id.toString() });
 
-  // Envoi email d’alerte aux admins (async, non bloquant)
+  // email aux admins
   try {
     const admins = await Admin.find({}).lean();
     const adminEmails = admins.map(a => a.email);
@@ -260,7 +248,6 @@ app.post('/api/requests', async (req,res) => {
   }
 });
 
-// Liste (par statut)
 app.get('/api/requests', authRequired, async (req,res) => {
   const status = (req.query.status || '').toLowerCase();
   const q = status ? { status } : {};
@@ -268,7 +255,6 @@ app.get('/api/requests', authRequired, async (req,res) => {
   return res.json({ items });
 });
 
-// Valider : envoie l’email signé par l’admin connecté (manager + RH) + le demandeur en CC
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -276,7 +262,6 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   rec.status = 'sent';
   await rec.save();
 
-  // Répondre d’abord pour ne pas bloquer l’UI
   res.json({ ok: true });
 
   const signName = req.admin.name;
@@ -304,7 +289,6 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   catch (e) { console.error('Mail validate err:', e.message); }
 });
 
-// Refuser / Annuler
 app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -323,17 +307,14 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// ====== Cron: relances J+2 et J+4 ======
-// Configurer un Cron Job Render (POST) chaque jour à 08:00 Europe/Paris :
-//   https://detachements-backend-sb26.onrender.com/internal/cron/reminders?token=VOTRE_SECRET
+// ====== Cron relances J+2 et J+4 ======
 app.post('/internal/cron/reminders', async (req,res) => {
   if (CRON_SECRET && req.query.token !== CRON_SECRET) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
-  const now = dayjs(); // UTC
+  const now = dayjs();
   const pending = await Request.find({ status: 'pending' });
-
   const admins = await Admin.find({}).lean();
   const adminEmails = admins.map(a => a.email);
 
@@ -343,56 +324,20 @@ app.post('/internal/cron/reminders', async (req,res) => {
     const created = dayjs(r.created_at);
     const ageDays = now.diff(created, 'day');
 
-    // J+2
     if (ageDays >= 2 && !r.reminder2_sent_at) {
       const subject = `Relance J+2 – Détachement en attente – ${r.full_name}`;
-      const html = `
-        <p>Relance J+2 — la demande suivante est toujours en attente :</p>
-        <ul>
-          <li>Demandeur : ${r.full_name} (${r.entity})</li>
-          <li>Dates : ${toFR(r.date_from)} → ${toFR(r.date_to)}</li>
-          <li>Lieu : ${r.place}</li>
-          <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
-        </ul>
-        <p>Espace validation : ${APP_BASE_URL}</p>
-      `;
-      try {
-        await sendMail({ to: adminEmails, subject, html });
-        r.reminder2_sent_at = new Date(); sent2++;
-      } catch(e){ console.error('reminder J+2 mail err:', e.message); }
+      const html = `<p>Relance J+2 — la demande est toujours en attente</p>`;
+      try { await sendMail({ to: adminEmails, subject, html }); r.reminder2_sent_at = new Date(); sent2++; } catch(e){}
       await r.save();
     }
-
-    // J+4
     if (ageDays >= 4 && !r.reminder4_sent_at) {
       const subject = `Relance J+4 – Détachement en attente – ${r.full_name}`;
-      const html = `
-        <p>Relance J+4 — la demande suivante est toujours en attente :</p>
-        <ul>
-          <li>Demandeur : ${r.full_name} (${r.entity})</li>
-          <li>Dates : ${toFR(r.date_from)} → ${toFR(r.date_to)}</li>
-          <li>Lieu : ${r.place}</li>
-          <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
-        </ul>
-        <p>Espace validation : ${APP_BASE_URL}</p>
-      `;
-      try {
-        await sendMail({ to: adminEmails, subject, html });
-        r.reminder4_sent_at = new Date(); sent4++;
-      } catch(e){ console.error('reminder J+4 mail err:', e.message); }
+      const html = `<p>Relance J+4 — la demande est toujours en attente</p>`;
+      try { await sendMail({ to: adminEmails, subject, html }); r.reminder4_sent_at = new Date(); sent4++; } catch(e){}
       await r.save();
     }
   }
-
   return res.json({ ok: true, sent2, sent4 });
-});
-
-// ====== Robustesse logs ======
-process.on('unhandledRejection', (reason) => {
-  console.error('unhandledRejection:', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('uncaughtException:', err);
 });
 
 // ====== Start ======
