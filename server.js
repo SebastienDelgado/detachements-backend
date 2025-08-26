@@ -1,4 +1,4 @@
-// server.js — Backend (Mongo + JWT + SMTP/Mailtrap + Alertes + Relances)
+// server.js — Backend (Mongo + JWT + SMTP/Mailtrap + Alertes + Relances + mails refus/annulation)
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
@@ -11,16 +11,15 @@ const {
   PORT = 3000,
   MONGODB_URI,
   JWT_SECRET,
-  // Front pour liens dans les mails
   APP_BASE_URL = 'http://localhost:5173',
-  // Cron secret pour /internal/cron/reminders
   CRON_SECRET,
-  // SMTP générique (préféré) — ou Mailtrap si non fourni
+
+  // SMTP prioritaire (ou Mailtrap en fallback)
   SMTP_HOST = process.env.MAILTRAP_HOST || 'sandbox.smtp.mailtrap.io',
   SMTP_PORT = Number(process.env.MAILTRAP_PORT || process.env.SMTP_PORT || 2525),
   SMTP_USER = process.env.MAILTRAP_USER || process.env.SMTP_USER,
   SMTP_PASS = process.env.MAILTRAP_PASS || process.env.SMTP_PASS,
-  // Expéditeur
+
   MAIL_FROM = process.env.MAIL_FROM || 'no-reply@csec-sg.com',
   MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'CSEC SG - Détachements',
 } = process.env;
@@ -37,10 +36,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    req.headers['access-control-request-headers'] || 'Content-Type, Authorization, Accept'
-  );
+  res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || 'Content-Type, Authorization, Accept');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
@@ -73,8 +69,8 @@ const RequestSchema = new mongoose.Schema({
   entity: String,
   date_from: String,
   date_to: String,
-  start_period: { type: String, default: 'FULL' },
-  end_period:   { type: String, default: 'FULL' },
+  start_period: { type: String, default: 'FULL' }, // FULL | AM | PM
+  end_period:   { type: String, default: 'FULL' }, // FULL | AM | PM
   place: String,
   type: String,
   days: Number,
@@ -127,6 +123,25 @@ async function authRequired(req, res, next) {
 function toFR(d) {
   if (!d || !/\d{4}-\d{2}-\d{2}/.test(d)) return d || '—';
   const [y,m,dd] = d.split('-'); return `${dd}/${m}/${y}`;
+}
+
+// Formatte les dates avec 1/2 journées (pour les e-mails)
+function datePhrase(rec) {
+  const a = rec.date_from, b = rec.date_to, sp = (rec.start_period||'FULL'), ep = (rec.end_period||'FULL');
+  const A = toFR(a), B = toFR(b);
+  if (!a && !b) return '—';
+  if (!b || a === b) {
+    if (sp === 'AM' && ep === 'AM') return `${A} (Matin)`;
+    if (sp === 'PM' && ep === 'PM') return `${A} (Après-midi)`;
+    if (sp === 'AM' && ep === 'PM') return `${A}`; // journée entière
+    if (sp === 'FULL' || ep === 'FULL') return `${A}`; // journée entière
+    return `${A}`; // fallback
+  }
+  // plage multi-jours
+  let tail = [];
+  if (sp === 'PM') tail.push('Début : Après-midi');
+  if (ep === 'AM') tail.push('Fin : Matin');
+  return `Du ${A} au ${B}${tail.length ? ' — ' + tail.join(', ') : ''}`;
 }
 
 // ----- Seed admins à la 1ère connexion -----
@@ -203,7 +218,7 @@ app.post('/api/requests', async (req,res) => {
       <p>Nouvelle demande en attente :</p>
       <ul>
         <li><strong>${rec.full_name}</strong> (${rec.entity})</li>
-        <li>Dates : ${toFR(rec.date_from)} → ${toFR(rec.date_to)}</li>
+        <li>Date(s) : ${datePhrase(rec)}</li>
         <li>Lieu : ${rec.place}</li>
         <li>Article 21 : ${rec.type} – ${rec.days} jour(s)</li>
         <li>Commentaire : ${rec.comment || '—'}</li>
@@ -224,7 +239,7 @@ app.get('/api/requests', authRequired, async (req,res) => {
   return res.json({ items });
 });
 
-// Valider + e-mail signé par l’admin
+// ----- VALIDATE -----
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -239,7 +254,7 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
       <br/><span style="color:#D71620">${rec.full_name}${rec.entity ? ' – ' + rec.entity : ''}</span>
     </p>
     <p>
-      Le(s) : <span style="color:#D71620">${toFR(rec.date_from)} au ${toFR(rec.date_to)}</span><br/>
+      Date(s) : <span style="color:#D71620">${datePhrase(rec)}</span><br/>
       À : <span style="color:#D71620">${rec.place}</span><br/>
       En article 21 : <span style="color:#D71620">${rec.type} – ${rec.days} jour(s)</span><br/>
       (Hors délai de route)
@@ -248,32 +263,76 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
     <p>Bonne fin de journée,</p>
     <p><strong>${signName}</strong><br/>CSEC SG</p>
   `;
-  try {
-    const to = [rec.manager_email, rec.hr_email].filter(Boolean);
-    const cc = [rec.applicant_email].filter(Boolean);
-    await sendMail({ to, cc, subject, html });
-  } catch(e){ console.error('Mail validate err:', e?.message || e); }
+
+  // Destinataires :
+  // A = manager + RH + Reine + Chrystelle
+  // CC = demandeur + Sébastien + Ludivine
+  const TO = [rec.manager_email, rec.hr_email, 'reine.allaglo@csec-sg.com', 'chrystelle.agea@socgen.com'].filter(Boolean);
+  const CC = [rec.applicant_email, 'sebastien.delgado@csec-sg.com', 'ludivine.perreaut@gmail.com'].filter(Boolean);
+
+  try { await sendMail({ to: TO, cc: CC, subject, html }); }
+  catch(e){ console.error('Mail validate err:', e?.message || e); }
 
   return res.json({ ok: true });
 });
 
-// Refuser
+// ----- REFUSE -----
 app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
-  rec.status = 'refused';
-  rec.refuse_reason = (req.body && req.body.reason) || '';
-  await rec.save();
+  const reason = (req.body && req.body.reason) || '';
+  rec.status = 'refused'; rec.refuse_reason = reason; await rec.save();
+
+  const subject = `Refus de détachement – ${rec.full_name}`;
+  const html = `
+    <p>Bonjour,</p>
+    <p>Votre demande de détachement a été <strong>refusée</strong>.</p>
+    <ul>
+      <li>Demandeur : ${rec.full_name} (${rec.entity})</li>
+      <li>Date(s) : ${datePhrase(rec)}</li>
+      <li>Lieu : ${rec.place}</li>
+      <li>Article 21 : ${rec.type} – ${rec.days} jour(s)</li>
+    </ul>
+    ${reason ? `<p>Motif : <em>${reason}</em></p>` : ''}
+    <p>Cordialement,</p>
+    <p><strong>${req.admin.name || 'CSEC SG'}</strong></p>
+  `;
+  try {
+    const admins = await Admin.find({}).lean();
+    const cc = admins.map(a => a.email);
+    await sendMail({ to: rec.applicant_email, cc, subject, html });
+  } catch(e){ console.error('Mail refuse err:', e?.message || e); }
+
   return res.json({ ok: true });
 });
 
-// Annuler
+// ----- CANCEL -----
 app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
-  rec.status = 'cancelled';
-  rec.cancel_reason = (req.body && req.body.reason) || '';
-  await rec.save();
+  const reason = (req.body && req.body.reason) || '';
+  rec.status = 'cancelled'; rec.cancel_reason = reason; await rec.save();
+
+  const subject = `Annulation de détachement – ${rec.full_name}`;
+  const html = `
+    <p>Bonjour,</p>
+    <p>Votre demande de détachement a été <strong>annulée</strong>.</p>
+    <ul>
+      <li>Demandeur : ${rec.full_name} (${rec.entity})</li>
+      <li>Date(s) : ${datePhrase(rec)}</li>
+      <li>Lieu : ${rec.place}</li>
+      <li>Article 21 : ${rec.type} – ${rec.days} jour(s)</li>
+    </ul>
+    ${reason ? `<p>Motif : <em>${reason}</em></p>` : ''}
+    <p>Cordialement,</p>
+    <p><strong>${req.admin.name || 'CSEC SG'}</strong></p>
+  `;
+  try {
+    const admins = await Admin.find({}).lean();
+    const cc = admins.map(a => a.email);
+    await sendMail({ to: rec.applicant_email, cc, subject, html });
+  } catch(e){ console.error('Mail cancel err:', e?.message || e); }
+
   return res.json({ ok: true });
 });
 
@@ -297,7 +356,7 @@ app.post('/internal/cron/reminders', async (req,res) => {
         <p>Relance J+2 — la demande suivante est toujours en attente :</p>
         <ul>
           <li>Demandeur : ${r.full_name} (${r.entity})</li>
-          <li>Dates : ${toFR(r.date_from)} → ${toFR(r.date_to)}</li>
+          <li>Date(s) : ${datePhrase(r)}</li>
           <li>Lieu : ${r.place}</li>
           <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
         </ul>
@@ -314,7 +373,7 @@ app.post('/internal/cron/reminders', async (req,res) => {
         <p>Relance J+4 — la demande suivante est toujours en attente :</p>
         <ul>
           <li>Demandeur : ${r.full_name} (${r.entity})</li>
-          <li>Dates : ${toFR(r.date_from)} → ${toFR(r.date_to)}</li>
+          <li>Date(s) : ${datePhrase(r)}</li>
           <li>Lieu : ${r.place}</li>
           <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
         </ul>
