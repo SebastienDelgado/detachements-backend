@@ -167,4 +167,99 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
 // Création
 app.post('/api/requests', async (req,res) => {
   const b = req.body || {};
-  const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','da]()
+  // 🔧 ligne corrigée : 'days' à la fin
+  const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
+  for (const k of required) {
+    if (!b[k]) return res.status(400).json({ error: `Champ manquant: ${k}` });
+  }
+  const rec = await Request.create({
+    full_name: b.fullName,
+    applicant_email: b.applicantEmail,
+    entity: b.entity,
+    date_from: b.dateFrom,
+    date_to: b.dateTo,
+    start_period: b.startPeriod || 'FULL',
+    end_period: b.endPeriod || 'FULL',
+    place: b.place,
+    type: b.type,
+    days: Number(b.days),
+    comment: b.comment || '',
+    manager_email: b.managerEmail,
+    hr_email: b.hrEmail,
+    status: 'pending',
+    created_at: new Date(),
+  });
+  return res.json({ ok: true, id: rec._id.toString() });
+});
+
+// Liste (par statut)
+app.get('/api/requests', authRequired, async (req,res) => {
+  const status = (req.query.status || '').toLowerCase();
+  const q = status ? { status } : {};
+  const items = await Request.find(q).sort({ created_at: -1 }).lean();
+  return res.json({ items });
+});
+
+// ----- Actions : VALIDATE / REFUSE / CANCEL -----
+app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
+  const rec = await Request.findById(req.params.id);
+  if (!rec) return res.status(404).json({ error: 'Not found' });
+
+  rec.status = 'sent';
+  await rec.save();
+
+  const signName = req.admin.name || 'Administrateur';
+  const subject = `Détachement – ${rec.full_name}`;
+  const html = `
+    <p>Bonjour,</p>
+    <p>Merci de bien vouloir noter le détachement de :
+      <br/><span style="color:#D71620">${rec.full_name}${rec.entity ? ' – ' + rec.entity : ''}</span>
+    </p>
+    <p>
+      Le(s) : <span style="color:#D71620">${toFR(rec.date_from)} au ${toFR(rec.date_to)}</span><br/>
+      À : <span style="color:#D71620">${rec.place}</span><br/>
+      En article 21 : <span style="color:#D71620">${rec.type} – ${rec.days} jour(s)</span><br/>
+      (Hors délai de route)
+    </p>
+    ${rec.comment ? `<p>Commentaire du demandeur : <span style="color:#D71620">${rec.comment}</span></p>` : ''}
+    <p>Bonne fin de journée,</p>
+    <p><strong>${signName}</strong><br/>CSEC SG</p>
+  `;
+  try {
+    const to = [rec.manager_email, rec.hr_email].filter(Boolean);
+    const cc = [rec.applicant_email].filter(Boolean);
+    const transporter = nodemailer.createTransport({
+      host: MAILTRAP_HOST, port: Number(MAILTRAP_PORT),
+      auth: { user: MAILTRAP_USER, pass: MAILTRAP_PASS },
+    });
+    await transporter.sendMail({
+      from: '"CSEC SG - Détachements" <no-reply@csec-sg.com>',
+      to: to.join(', '), cc: cc.join(', '), subject, html
+    });
+  } catch(e){ console.error('Mail validate err:', e.message); }
+
+  return res.json({ ok: true });
+});
+
+app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
+  const rec = await Request.findById(req.params.id);
+  if (!rec) return res.status(404).json({ error: 'Not found' });
+  rec.status = 'refused';
+  rec.refuse_reason = (req.body && req.body.reason) || '';
+  await rec.save();
+  return res.json({ ok: true });
+});
+
+app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
+  const rec = await Request.findById(req.params.id);
+  if (!rec) return res.status(404).json({ error: 'Not found' });
+  rec.status = 'cancelled';
+  rec.cancel_reason = (req.body && req.body.reason) || '';
+  await rec.save();
+  return res.json({ ok: true });
+});
+
+// ----- Start -----
+app.listen(PORT, () => {
+  console.log(`🚀 API listening on port ${PORT}`);
+});
