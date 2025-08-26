@@ -405,3 +405,9 @@ app.post('/internal/cron/reminders', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`API listening on port ${PORT}`);
 });
+// ----- Global error handler (debug) -----
+app.use((err, req, res, next) => {
+  console.error('[ERROR]', err && err.stack ? err.stack : err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Server error', message: String(err && err.message || err) });
+});
