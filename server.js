@@ -1,4 +1,4 @@
-// server.js — Backend production-ready (Mongo + JWT + Mailtrap + Reminders)
+// server.js — Backend (Mongo + JWT + Mailtrap + Reminders) — CORS patché
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -16,7 +16,10 @@ const {
   MAILTRAP_PORT = 2525,
   MAILTRAP_USER,
   MAILTRAP_PASS,
-  APP_BASE_URL = 'http://localhost:5173',
+  // URL de l’app front (affiché dans les emails)
+  APP_BASE_URL = 'https://cgtsg-detachements-art21-csecsg.netlify.app',
+  // secret pour la route cron
+  CRON_SECRET = null,
 } = process.env;
 
 if (!MONGODB_URI || !JWT_SECRET) {
@@ -24,60 +27,71 @@ if (!MONGODB_URI || !JWT_SECRET) {
   process.exit(1);
 }
 
-const ALLOWED_ORIGINS = [
-  APP_BASE_URL,
-  'http://localhost:5173',
-  'http://localhost:3000',
-];
-
 // ----- App -----
 const app = express();
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    // ouvre si besoin pendant les tests :
-    return cb(null, true);
-  },
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','Accept'],
+
+// CORS ULTRA-PERMISSIF (corrige les échecs "Load failed" dus au pré-vol)
+const corsOptions = {
+  origin: true, // reflète automatiquement l’Origin de la page appelante
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
   credentials: false,
-  maxAge: 86400,
-}));
-app.use(express.json());
+  maxAge: 86400, // cache du pré-vol (s)
+};
+app.use(cors(corsOptions));
+// Répondre explicitement aux pré-vols (OPTIONS) pour toutes les routes
+app.options('*', cors(corsOptions));
+
+app.use(express.json({ limit: '1mb' }));
 
 // ----- DB -----
 mongoose.set('strictQuery', true);
-mongoose.connect(MONGODB_URI).then(()=>console.log('MongoDB connected')).catch((e)=>{console.error(e); process.exit(1);});
+mongoose
+  .connect(MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
 
 // ----- Schemas -----
-const AdminSchema = new mongoose.Schema({
-  email: { type: String, unique: true, required: true },
-  name:  { type: String, required: true },
-  passwordHash: { type: String, required: true },
-}, { timestamps: true });
+const AdminSchema = new mongoose.Schema(
+  {
+    email: { type: String, unique: true, required: true },
+    name: { type: String, required: true },
+    passwordHash: { type: String, required: true },
+  },
+  { timestamps: true }
+);
 
-const RequestSchema = new mongoose.Schema({
-  full_name: String,
-  applicant_email: String,
-  entity: String,
-  date_from: String, // yyyy-mm-dd
-  date_to: String,
-  start_period: { type: String, default: 'FULL' },
-  end_period:   { type: String, default: 'FULL' },
-  place: String,
-  type: String,
-  days: Number,
-  comment: String,
-  manager_email: String,
-  hr_email: String,
-  status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
-  created_at: { type: Date, default: () => new Date() },
+const RequestSchema = new mongoose.Schema(
+  {
+    full_name: String,
+    applicant_email: String,
+    entity: String,
+    date_from: String, // yyyy-mm-dd
+    date_to: String,
+    start_period: { type: String, default: 'FULL' },
+    end_period: { type: String, default: 'FULL' },
+    place: String,
+    type: String,
+    days: Number,
+    comment: String,
+    manager_email: String,
+    hr_email: String,
+    status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
+    created_at: { type: Date, default: () => new Date() },
 
-  // relances
-  reminder2_sent_at: Date, // J+2
-  reminder4_sent_at: Date, // J+4
-}, { timestamps: true });
+    // relances
+    reminder2_sent_at: Date, // J+2
+    reminder4_sent_at: Date, // J+4
+
+    // motifs (optionnels)
+    refuse_reason: String,
+    cancel_reason: String,
+  },
+  { timestamps: true }
+);
 
 const Admin = mongoose.model('Admin', AdminSchema);
 const Request = mongoose.model('Request', RequestSchema);
@@ -86,10 +100,15 @@ const Request = mongoose.model('Request', RequestSchema);
 const transporter = nodemailer.createTransport({
   host: MAILTRAP_HOST,
   port: Number(MAILTRAP_PORT),
-  auth: { user: MAILTRAP_USER, pass: MAILTRAP_PASS },
+  auth: MAILTRAP_USER && MAILTRAP_PASS ? { user: MAILTRAP_USER, pass: MAILTRAP_PASS } : undefined,
 });
 
 async function sendMail({ to, cc = [], subject, html }) {
+  // En mode test Mailtrap, l’envoi échoue si les credentials manquent : on no-op mais on log
+  if (!MAILTRAP_HOST || !MAILTRAP_USER || !MAILTRAP_PASS) {
+    console.log('[MAIL MOCK]', { to, cc, subject });
+    return;
+  }
   return transporter.sendMail({
     from: '"CSEC SG - Détachements" <no-reply@csec-sg.com>',
     to: Array.isArray(to) ? to.join(', ') : to,
@@ -101,7 +120,11 @@ async function sendMail({ to, cc = [], subject, html }) {
 
 // ----- Utils -----
 function signToken(admin) {
-  return jwt.sign({ sub: admin._id.toString(), name: admin.name, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign(
+    { sub: admin._id.toString(), name: admin.name, email: admin.email },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
 }
 
 async function authRequired(req, res, next) {
@@ -120,7 +143,7 @@ async function authRequired(req, res, next) {
 
 function toFR(d) {
   if (!d || !/\d{4}-\d{2}-\d{2}/.test(d)) return d || '—';
-  const [y,m,dd] = d.split('-');
+  const [y, m, dd] = d.split('-');
   return `${dd}/${m}/${y}`;
 }
 
@@ -132,8 +155,8 @@ async function seedAdmins() {
   // MDP initiaux (à changer après la 1ère connexion)
   const SEB_EMAIL = 'sebastien.delgado@csec-sg.com';
   const LUDI_EMAIL = 'ludivine.perreaut@gmail.com';
-  const SEB_PASS = 'SeB!24-9vQ@csec';     // ➜ à changer
-  const LUDI_PASS = 'LuD!24-7mX@csec';    // ➜ à changer
+  const SEB_PASS = 'SeB!24-9vQ@csec'; // ➜ à changer
+  const LUDI_PASS = 'LuD!24-7mX@csec'; // ➜ à changer
 
   const a1 = new Admin({
     email: SEB_EMAIL,
@@ -145,7 +168,8 @@ async function seedAdmins() {
     name: 'Ludivine PERREAUT',
     passwordHash: await bcrypt.hash(LUDI_PASS, 10),
   });
-  await a1.save(); await a2.save();
+  await a1.save();
+  await a2.save();
 
   console.log('Admins seeded:');
   console.log(` - ${a1.name} <${SEB_EMAIL}> / MDP initial: ${SEB_PASS}`);
@@ -154,10 +178,10 @@ async function seedAdmins() {
 seedAdmins().catch(console.error);
 
 // ----- Health -----
-app.get('/api/health', (req,res) => res.json({ ok: true }));
+app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // ----- Auth -----
-app.post('/api/auth/login', async (req,res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   const admin = await Admin.findOne({ email });
   if (!admin) return res.status(401).json({ error: 'Identifiants invalides' });
@@ -167,7 +191,7 @@ app.post('/api/auth/login', async (req,res) => {
   return res.json({ token, name: admin.name, email: admin.email });
 });
 
-app.post('/api/auth/change-password', authRequired, async (req,res) => {
+app.post('/api/auth/change-password', authRequired, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   const ok = await bcrypt.compare(currentPassword || '', req.admin.passwordHash);
   if (!ok) return res.status(400).json({ error: 'Mot de passe actuel invalide' });
@@ -178,12 +202,24 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
 
 // ----- Requests -----
 // Création : envoie un mail aux 2 admins
-app.post('/api/requests', async (req,res) => {
+app.post('/api/requests', async (req, res) => {
   const b = req.body || {};
-  const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
+  const required = [
+    'fullName',
+    'applicantEmail',
+    'entity',
+    'dateFrom',
+    'dateTo',
+    'place',
+    'type',
+    'managerEmail',
+    'hrEmail',
+    'days',
+  ];
   for (const k of required) {
     if (!b[k]) return res.status(400).json({ error: `Champ manquant: ${k}` });
   }
+
   const rec = await Request.create({
     full_name: b.fullName,
     applicant_email: b.applicantEmail,
@@ -204,7 +240,7 @@ app.post('/api/requests', async (req,res) => {
 
   // Récupère tous les admins
   const admins = await Admin.find({}).lean();
-  const adminEmails = admins.map(a => a.email);
+  const adminEmails = admins.map((a) => a.email);
 
   // Mail d’alerte aux admins
   const subject = `Nouvelle demande de détachement – ${rec.full_name}`;
@@ -222,13 +258,15 @@ app.post('/api/requests', async (req,res) => {
   `;
   try {
     await sendMail({ to: adminEmails, subject, html });
-  } catch (e) { console.error('Mail admins (création) err:', e.message); }
+  } catch (e) {
+    console.error('Mail admins (création) err:', e.message);
+  }
 
   return res.json({ ok: true, id: rec._id.toString() });
 });
 
 // Liste (par statut)
-app.get('/api/requests', authRequired, async (req,res) => {
+app.get('/api/requests', authRequired, async (req, res) => {
   const status = (req.query.status || '').toLowerCase();
   const q = status ? { status } : {};
   const items = await Request.find(q).sort({ created_at: -1 }).lean();
@@ -236,7 +274,7 @@ app.get('/api/requests', authRequired, async (req,res) => {
 });
 
 // Valider : envoie l’email signé par l’admin connecté
-app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
+app.post('/api/requests/:id/validate', authRequired, async (req, res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
   rec.status = 'sent';
@@ -266,13 +304,15 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
 
   try {
     await sendMail({ to, cc, subject, html });
-  } catch (e) { console.error('Mail validate err:', e.message); }
+  } catch (e) {
+    console.error('Mail validate err:', e.message);
+  }
 
   return res.json({ ok: true });
 });
 
-// Refuser / Annuler : mail d’info (facultatif, ici console uniquement)
-app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
+// Refuser / Annuler
+app.post('/api/requests/:id/refuse', authRequired, async (req, res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
   rec.status = 'refused';
@@ -281,7 +321,7 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
+app.post('/api/requests/:id/cancel', authRequired, async (req, res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
   rec.status = 'cancelled';
@@ -293,18 +333,19 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
 // ----- Cron: relances J+2 et J+4 -----
 // Crée un "Cron Job" Render qui appelle cette route chaque jour à 08:00 Europe/Paris.
 // Ajoute un secret ?token=XXX dans l’URL (et configure le même secret en ENV CRON_SECRET)
-const CRON_SECRET = process.env.CRON_SECRET || null;
+app.post('/internal/cron/reminders', async (req, res) => {
+  if (CRON_SECRET && req.query.token !== CRON_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
 
-app.post('/internal/cron/reminders', async (req,res) => {
-  if (CRON_SECRET && req.query.token !== CRON_SECRET) return res.status(403).json({ error: 'Forbidden' });
-
-  const now = dayjs(); // en UTC
+  const now = dayjs(); // UTC
   const pending = await Request.find({ status: 'pending' });
 
   const admins = await Admin.find({}).lean();
-  const adminEmails = admins.map(a => a.email);
+  const adminEmails = admins.map((a) => a.email);
 
-  let sent2 = 0, sent4 = 0;
+  let sent2 = 0,
+    sent4 = 0;
 
   for (const r of pending) {
     const created = dayjs(r.created_at);
@@ -323,7 +364,13 @@ app.post('/internal/cron/reminders', async (req,res) => {
         </ul>
         <p>Espace validation : ${APP_BASE_URL}</p>
       `;
-      try { await sendMail({ to: adminEmails, subject, html }); r.reminder2_sent_at = new Date(); sent2++; } catch(e){ console.error('reminder J+2 mail err:', e.message); }
+      try {
+        await sendMail({ to: adminEmails, subject, html });
+        r.reminder2_sent_at = new Date();
+        sent2++;
+      } catch (e) {
+        console.error('reminder J+2 mail err:', e.message);
+      }
       await r.save();
     }
 
@@ -340,7 +387,13 @@ app.post('/internal/cron/reminders', async (req,res) => {
         </ul>
         <p>Espace validation : ${APP_BASE_URL}</p>
       `;
-      try { await sendMail({ to: adminEmails, subject, html }); r.reminder4_sent_at = new Date(); sent4++; } catch(e){ console.error('reminder J+4 mail err:', e.message); }
+      try {
+        await sendMail({ to: adminEmails, subject, html });
+        r.reminder4_sent_at = new Date();
+        sent4++;
+      } catch (e) {
+        console.error('reminder J+4 mail err:', e.message);
+      }
       await r.save();
     }
   }
