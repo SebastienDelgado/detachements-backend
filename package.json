@@ -1,1 +1,22 @@
-{"name": "detachements-art21-backend", "version": "2.0.0", "main": "server.js"}
+{
+  "name": "detachements-art21-backend",
+  "version": "2.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18 <23"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dayjs": "^1.11.11",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.5.0",
+    "nodemailer": "^6.9.11"
+  }
+}
+
