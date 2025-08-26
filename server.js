@@ -1,4 +1,19 @@
-// server.js — Backend production-ready (Mongo + JWT + Mailtrap + Reminders + CORS patch)
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    req.headers['access-control-request-headers'] || 'Content-Type, Authorization, Accept'
+  );
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false }));
+/ server.js — Backend production-ready (Mongo + JWT + Mailtrap + Reminders + CORS patch)
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
