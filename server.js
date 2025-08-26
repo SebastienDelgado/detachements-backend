@@ -1,4 +1,4 @@
-// server.js — Backend (Mongo + JWT + SMTP/Mailtrap + Alertes + Relances + mails refus/annulation)
+// server.js — Backend (Mongo + JWT + SMTP/Mailtrap + Alertes + Relances quotidiennes + mails refus/annulation)
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
@@ -79,10 +79,13 @@ const RequestSchema = new mongoose.Schema({
   hr_email: String,
   status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
   created_at: { type: Date, default: () => new Date() },
+
+  // anciennes relances (conservées — non utilisées avec la quotidienne)
   reminder2_sent_at: Date,
   reminder4_sent_at: Date,
-  refuse_reason: String,
-  cancel_reason: String,
+
+  // relance quotidienne : trace la dernière date (Europe/Paris) au format "YYYY-MM-DD"
+  reminder_last_sent_on: String,
 }, { timestamps: true });
 
 const Admin = mongoose.model('Admin', AdminSchema);
@@ -124,24 +127,33 @@ function toFR(d) {
   if (!d || !/\d{4}-\d{2}-\d{2}/.test(d)) return d || '—';
   const [y,m,dd] = d.split('-'); return `${dd}/${m}/${y}`;
 }
-
-// Formatte les dates avec 1/2 journées (pour les e-mails)
 function datePhrase(rec) {
-  const a = rec.date_from, b = rec.date_to, sp = (rec.start_period||'FULL'), ep = (rec.end_period||'FULL');
-  const A = toFR(a), B = toFR(b);
-  if (!a && !b) return '—';
+  const a = rec.date_from, b = rec.date_to, sp = (rec.start_period||'FULL').toUpperCase(), ep = (rec.end_period||'FULL').toUpperCase();
+  const A = toFR(a), B = toFR(b || a);
   if (!b || a === b) {
     if (sp === 'AM' && ep === 'AM') return `${A} (Matin)`;
     if (sp === 'PM' && ep === 'PM') return `${A} (Après-midi)`;
-    if (sp === 'AM' && ep === 'PM') return `${A}`; // journée entière
-    if (sp === 'FULL' || ep === 'FULL') return `${A}`; // journée entière
-    return `${A}`; // fallback
+    if (sp === 'AM' && ep === 'PM') return `${A}`;
+    if (sp === 'FULL' || ep === 'FULL') return `${A}`;
+    return `${A}`;
   }
-  // plage multi-jours
-  let tail = [];
+  const tail = [];
   if (sp === 'PM') tail.push('Début : Après-midi');
   if (ep === 'AM') tail.push('Fin : Matin');
   return `Du ${A} au ${B}${tail.length ? ' — ' + tail.join(', ') : ''}`;
+}
+// "YYYY-MM-DD" du jour en Europe/Paris
+function todayParisISO() {
+  const parts = new Intl.DateTimeFormat('fr-FR', {
+    timeZone: 'Europe/Paris',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date());
+  const dd = parts.find(p => p.type === 'day').value;
+  const mm = parts.find(p => p.type === 'month').value;
+  const yyyy = parts.find(p => p.type === 'year').value;
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 // ----- Seed admins à la 1ère connexion -----
@@ -240,6 +252,7 @@ app.get('/api/requests', authRequired, async (req,res) => {
 });
 
 // ----- VALIDATE -----
+// Envoie l'email signé par l’admin connecté
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -298,9 +311,7 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
     <p><strong>${req.admin.name || 'CSEC SG'}</strong></p>
   `;
   try {
-    const admins = await Admin.find({}).lean();
-    const cc = admins.map(a => a.email);
-    await sendMail({ to: rec.applicant_email, cc, subject, html });
+    await sendMail({ to: rec.applicant_email, subject, html }); // pas de CC
   } catch(e){ console.error('Mail refuse err:', e?.message || e); }
 
   return res.json({ ok: true });
@@ -328,64 +339,55 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
     <p><strong>${req.admin.name || 'CSEC SG'}</strong></p>
   `;
   try {
-    const admins = await Admin.find({}).lean();
-    const cc = admins.map(a => a.email);
-    await sendMail({ to: rec.applicant_email, cc, subject, html });
+    await sendMail({ to: rec.applicant_email, subject, html }); // pas de CC
   } catch(e){ console.error('Mail cancel err:', e?.message || e); }
 
   return res.json({ ok: true });
 });
 
-// ----- Cron: relances J+2 & J+4 -----
+// ----- Cron: relance quotidienne 08:00 Europe/Paris -----
+// Appel: POST /internal/cron/reminders?token=TON_SECRET
 app.post('/internal/cron/reminders', async (req,res) => {
-  if (CRON_SECRET && req.query.token !== CRON_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  if (CRON_SECRET && req.query.token !== CRON_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
 
-  const now = dayjs();
+  const today = todayParisISO(); // "YYYY-MM-DD" en Europe/Paris
   const pending = await Request.find({ status: 'pending' });
+
   const admins = await Admin.find({}).lean();
   const adminEmails = admins.map(a => a.email);
 
-  let sent2 = 0, sent4 = 0;
+  let sent = 0;
 
   for (const r of pending) {
-    const ageDays = now.diff(dayjs(r.created_at), 'day');
+    // évite d’envoyer plusieurs fois le même jour
+    if (r.reminder_last_sent_on === today) continue;
 
-    if (ageDays >= 2 && !r.reminder2_sent_at) {
-      const subject = `Relance J+2 – Détachement en attente – ${r.full_name}`;
-      const html = `
-        <p>Relance J+2 — la demande suivante est toujours en attente :</p>
-        <ul>
-          <li>Demandeur : ${r.full_name} (${r.entity})</li>
-          <li>Date(s) : ${datePhrase(r)}</li>
-          <li>Lieu : ${r.place}</li>
-          <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
-        </ul>
-        <p>Espace validation : ${APP_BASE_URL}</p>
-      `;
-      try { await sendMail({ to: adminEmails, subject, html }); r.reminder2_sent_at = new Date(); sent2++; }
-      catch(e){ console.error('reminder J+2 mail err:', e?.message || e); }
-      await r.save();
-    }
+    const subject = `Relance quotidienne — Détachement en attente — ${r.full_name}`;
+    const html = `
+      <p>Une demande de détachement est toujours en attente :</p>
+      <ul>
+        <li>Demandeur : <strong>${r.full_name}</strong> (${r.entity})</li>
+        <li>Date(s) : ${datePhrase(r)}</li>
+        <li>Lieu : ${r.place}</li>
+        <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
+        ${r.comment ? `<li>Commentaire : ${r.comment}</li>` : ''}
+      </ul>
+      <p>Espace validation : ${APP_BASE_URL}</p>
+    `;
 
-    if (ageDays >= 4 && !r.reminder4_sent_at) {
-      const subject = `Relance J+4 – Détachement en attente – ${r.full_name}`;
-      const html = `
-        <p>Relance J+4 — la demande suivante est toujours en attente :</p>
-        <ul>
-          <li>Demandeur : ${r.full_name} (${r.entity})</li>
-          <li>Date(s) : ${datePhrase(r)}</li>
-          <li>Lieu : ${r.place}</li>
-          <li>Article 21 : ${r.type} – ${r.days} jour(s)</li>
-        </ul>
-        <p>Espace validation : ${APP_BASE_URL}</p>
-      `;
-      try { await sendMail({ to: adminEmails, subject, html }); r.reminder4_sent_at = new Date(); sent4++; }
-      catch(e){ console.error('reminder J+4 mail err:', e?.message || e); }
+    try {
+      await sendMail({ to: adminEmails, subject, html });
+      r.reminder_last_sent_on = today;
       await r.save();
+      sent++;
+    } catch (e) {
+      console.error('relance quotidienne — erreur mail:', e?.message || e);
     }
   }
 
-  return res.json({ ok: true, sent2, sent4 });
+  return res.json({ ok: true, sent });
 });
 
 // ----- Start -----
