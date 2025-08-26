@@ -1,12 +1,12 @@
-// server.js — Backend production-ready (Mongo + JWT + Mailtrap + Reminders)
+// server.js — Backend (Mongo + JWT + Mailtrap)
 const express = require('express');
-const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const dayjs = require('dayjs');
 
+// ----- Config -----
 const {
   PORT = 3000,
   MONGODB_URI,
@@ -18,22 +18,15 @@ const {
   APP_BASE_URL = 'http://localhost:5173',
 } = process.env;
 
-// --- Vérif ENV obligatoires
 if (!MONGODB_URI || !JWT_SECRET) {
   console.error('❌ Missing ENV: MONGODB_URI or JWT_SECRET');
   process.exit(1);
 }
 
-const ALLOWED_ORIGINS = [
-  APP_BASE_URL,
-  'http://localhost:5173',
-  'http://localhost:3000',
-];
-
-// --- App
+// ----- App -----
 const app = express();
 
-// --- Middleware CORS universel
+// CORS universel (et OPTIONS)
 app.use((req, res, next) => {
   const origin = req.headers.origin || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
@@ -47,13 +40,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Parsers
+// Parsers JSON + x-www-form-urlencoded
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-// --- Connexion Mongo avec retry
+// ----- DB (retry) -----
 mongoose.set('strictQuery', true);
-
 async function connectWithRetry() {
   try {
     await mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
@@ -65,7 +57,7 @@ async function connectWithRetry() {
 }
 connectWithRetry();
 
-// --- Schemas
+// ----- Schemas -----
 const AdminSchema = new mongoose.Schema({
   email: { type: String, unique: true, required: true },
   name:  { type: String, required: true },
@@ -86,7 +78,7 @@ const RequestSchema = new mongoose.Schema({
   comment: String,
   manager_email: String,
   hr_email: String,
-  status: { type: String, default: 'pending' },
+  status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
   created_at: { type: Date, default: () => new Date() },
   reminder2_sent_at: Date,
   reminder4_sent_at: Date,
@@ -95,7 +87,7 @@ const RequestSchema = new mongoose.Schema({
 const Admin = mongoose.model('Admin', AdminSchema);
 const Request = mongoose.model('Request', RequestSchema);
 
-// --- Mailer
+// ----- Mailer (Mailtrap) -----
 const transporter = nodemailer.createTransport({
   host: MAILTRAP_HOST,
   port: Number(MAILTRAP_PORT),
@@ -106,12 +98,11 @@ async function sendMail({ to, cc = [], subject, html }) {
     from: '"CSEC SG - Détachements" <no-reply@csec-sg.com>',
     to: Array.isArray(to) ? to.join(', ') : to,
     cc: Array.isArray(cc) ? cc.join(', ') : cc,
-    subject,
-    html,
+    subject, html,
   });
 }
 
-// --- Utils
+// ----- Utils -----
 function signToken(admin) {
   return jwt.sign({ sub: admin._id.toString(), name: admin.name, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
 }
@@ -134,7 +125,7 @@ function toFR(d) {
   return `${dd}/${m}/${y}`;
 }
 
-// --- Seed admins au moment de la connexion
+// ----- Seed admins quand DB connectée -----
 mongoose.connection.on('connected', async () => {
   const existing = await Admin.find({}).lean();
   if (existing.length) return;
@@ -143,23 +134,16 @@ mongoose.connection.on('connected', async () => {
   const SEB_PASS = 'SeB!24-9vQ@csec';
   const LUDI_PASS = 'LuD!24-7mX@csec';
 
-  const a1 = new Admin({
-    email: SEB_EMAIL,
-    name: 'Sébastien DELGADO',
-    passwordHash: await bcrypt.hash(SEB_PASS, 10),
-  });
-  const a2 = new Admin({
-    email: LUDI_EMAIL,
-    name: 'Ludivine PERREAUT',
-    passwordHash: await bcrypt.hash(LUDI_PASS, 10),
-  });
+  const a1 = new Admin({ email: SEB_EMAIL, name: 'Sébastien DELGADO', passwordHash: await bcrypt.hash(SEB_PASS, 10) });
+  const a2 = new Admin({ email: LUDI_EMAIL, name: 'Ludivine PERREAUT', passwordHash: await bcrypt.hash(LUDI_PASS, 10) });
   await a1.save(); await a2.save();
   console.log('Admins seeded.');
 });
 
-// --- Routes
+// ----- Health -----
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 
+// ----- Auth -----
 app.post('/api/auth/login', async (req,res) => {
   const { email, password } = req.body || {};
   const admin = await Admin.findOne({ email });
@@ -179,40 +163,8 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
+// ----- Requests -----
+// Création
 app.post('/api/requests', async (req,res) => {
   const b = req.body || {};
-  const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
-  for (const k of required) {
-    if (!b[k]) return res.status(400).json({ error: `Champ manquant: ${k}` });
-  }
-  const rec = await Request.create({
-    full_name: b.fullName,
-    applicant_email: b.applicantEmail,
-    entity: b.entity,
-    date_from: b.dateFrom,
-    date_to: b.dateTo,
-    start_period: b.startPeriod || 'FULL',
-    end_period: b.endPeriod || 'FULL',
-    place: b.place,
-    type: b.type,
-    days: b.days,
-    comment: b.comment || '',
-    manager_email: b.managerEmail,
-    hr_email: b.hrEmail,
-    status: 'pending',
-    created_at: new Date(),
-  });
-  return res.json({ ok: true, id: rec._id.toString() });
-});
-
-app.get('/api/requests', authRequired, async (req,res) => {
-  const status = (req.query.status || '').toLowerCase();
-  const q = status ? { status } : {};
-  const items = await Request.find(q).sort({ created_at: -1 }).lean();
-  return res.json({ items });
-});
-
-// --- Start
-app.listen(PORT, () => {
-  console.log(`🚀 API listening on port ${PORT}`);
-});
+  const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','da]()
