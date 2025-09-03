@@ -1,8 +1,11 @@
-// server.js — Backend (Mongo + JWT + SMTP Gmail + Alertes + Relances quotidiennes)
-// Gmail (app password) sur smtp.gmail.com:587 STARTTLS
-// Patches inclus : compat id (_id -> id) + contrôle d'ObjectId
-// Demandes spécifiques : dates (AM/PM) formatées, validation sans commentaire ni valideurs en copie
-// Expéditeur aligné sur SMTP_USER pour éviter 530 Authentication required
+// server.js — Backend (Mongo + JWT + Gmail SMTP via MAIL_* + Alertes + Relances quotidiennes)
+// Utilise UNIQUEMENT les variables MAIL_*
+// - MAIL_HOST  = smtp.gmail.com
+// - MAIL_PORT  = 587
+// - MAIL_USER  = ton_adresse@gmail.com
+// - MAIL_PASS  = mot_de_passe_application (16 char sans espaces)
+// - MAIL_FROM_NAME = Détachements CGT-SG Article 21 CSEC-SG
+// Autres: MONGODB_URI, JWT_SECRET, APP_BASE_URL, CRON_SECRET, CORS_ORIGINS
 
 const express = require('express');
 const cors = require('cors');
@@ -16,29 +19,21 @@ const {
   PORT = 3000,
   MONGODB_URI,
   JWT_SECRET,
-  APP_BASE_URL = 'http://localhost:5173',
+  APP_BASE_URL = 'http://https://cgtsg-detachements-art21-csecsg.netlify.app',
   CRON_SECRET,
-
-  // === SMTP (GMAIL) ===
-  SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com',
-  SMTP_PORT = Number(process.env.SMTP_PORT || 587),          // Gmail: 587
-  SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true' ? true : false, // false -> STARTTLS
-  SMTP_USER,    // ex: detachements.art21.csecsg@gmail.com
-  SMTP_PASS,    // app password (16 chars sans espaces)
-
-  // Émetteur affiché (nom). L'adresse utilisée sera forcement SMTP_USER (enveloppe + From).
-  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
-
-  // CORS (liste d’origines séparées par des virgules)
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
+
+  // UNIQUEMENT les MAIL_* :
+  MAIL_HOST = 'smtp.gmail.com',
+  MAIL_PORT = Number(process.env.MAIL_PORT || 587),
+  MAIL_USER = process.env.MAIL_USER || '',
+  MAIL_PASS = process.env.MAIL_PASS || '',
+  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 } = process.env;
 
 if (!MONGODB_URI || !JWT_SECRET) {
   console.error('❌ Missing ENV: MONGODB_URI or JWT_SECRET');
   process.exit(1);
-}
-if (!SMTP_USER || !SMTP_PASS) {
-  console.warn('⚠️ SMTP_USER / SMTP_PASS non définis : l’envoi d’e-mails échouera.');
 }
 
 // ====== APP & CORS ======
@@ -51,9 +46,9 @@ const allowedOrigins = (CORS_ORIGINS || '')
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    if (allowedOrigins.length === 0) return cb(null, true); // open
+    if (allowedOrigins.length === 0) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(null, true); // restreindre en prod si besoin
+    return cb(null, true);
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Accept'],
@@ -97,8 +92,6 @@ const RequestSchema = new mongoose.Schema({
   hr_email: String,
   status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
   created_at: { type: Date, default: () => new Date() },
-
-  // Relance quotidienne (éviter doublons dans la même journée Europe/Paris)
   reminder_last_sent_on: String, // "YYYY-MM-DD"
 }, { timestamps: true });
 
@@ -126,45 +119,29 @@ function toFR(d) {
   if (!d || !/\d{4}-\d{2}-\d{2}/.test(d)) return d || '—';
   const [y,m,dd] = d.split('-'); return `${dd}/${m}/${y}`;
 }
-// Nouvelle logique d'affichage des dates (AM/PM selon besoin)
+// Dates avec logique AM/PM demandée
 function datePhrase(rec) {
   const a = rec.date_from;
   const b = rec.date_to || rec.date_from;
-  const sp = (rec.start_period || 'FULL').toUpperCase(); // FULL | AM | PM
+  const sp = (rec.start_period || 'FULL').toUpperCase();
   const ep = (rec.end_period   || 'FULL').toUpperCase();
-  const A = toFR(a);
-  const B = toFR(b);
+  const A = toFR(a), B = toFR(b);
+  const isSame = a === b;
 
-  const isSameDay = (a === b);
-
-  // Même jour
-  if (isSameDay) {
-    if ((sp === 'FULL' && ep === 'FULL') || (sp === 'AM' && ep === 'PM')) {
-      // journée entière
-      return `${A}`;
-    }
+  if (isSame) {
+    if ((sp === 'FULL' && ep === 'FULL') || (sp === 'AM' && ep === 'PM')) return `${A}`;
     if (sp === 'AM' && ep === 'AM') return `${A} (Matin)`;
     if (sp === 'PM' && ep === 'PM') return `${A} (Après-midi)`;
-    // cas tordu (AM/FULL) etc. -> on considère pleine journée
     return `${A}`;
   }
-
-  // Période > 1 jour
-  const startTail = (sp === 'FULL') ? '' : (sp === 'AM' ? ' (Matin)' : ' (Après-midi)');
-  const endTail   = (ep === 'FULL') ? '' : (ep === 'AM' ? ' (Matin)' : ' (Après-midi)');
-
-  if (!startTail && !endTail) {
-    // nuits/jours entiers -> pas de mention matin/AM
-    return `Du ${A} au ${B}`;
-  }
+  const startTail = sp === 'FULL' ? '' : (sp === 'AM' ? ' (Matin)' : ' (Après-midi)');
+  const endTail   = ep === 'FULL' ? '' : (ep === 'AM' ? ' (Matin)' : ' (Après-midi)');
+  if (!startTail && !endTail) return `Du ${A} au ${B}`;
   return `Du ${A}${startTail} au ${B}${endTail}`;
 }
 function todayParisISO() {
   const parts = new Intl.DateTimeFormat('fr-FR', {
-    timeZone: 'Europe/Paris',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
+    timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit'
   }).formatToParts(new Date());
   const dd = parts.find(p => p.type === 'day').value;
   const mm = parts.find(p => p.type === 'month').value;
@@ -187,39 +164,40 @@ function getSignatureHtml(admin) {
   return `<p><strong>${admin.name}</strong><br/>${title}</p>`;
 }
 
-// ====== Mailer (Gmail) ======
+// ====== Mailer (Gmail via MAIL_*) ======
+console.log(`✉️  MAIL config -> host=${MAIL_HOST} port=${MAIL_PORT} user=${MAIL_USER ? '[set]' : '(missing)'} fromName="${MAIL_FROM_NAME}"`);
+
 const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,          // 'smtp.gmail.com'
-  port: SMTP_PORT,          // 587
-  secure: SMTP_SECURE,      // false (STARTTLS)
-  auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-  requireTLS: true,         // force STARTTLS
+  host: MAIL_HOST,             // smtp.gmail.com
+  port: MAIL_PORT,             // 587
+  secure: false,               // STARTTLS (ne pas passer à true sur 587)
+  auth: MAIL_USER && MAIL_PASS ? { user: MAIL_USER, pass: MAIL_PASS } : undefined,
+  requireTLS: true,            // force STARTTLS
+  tls: { minVersion: 'TLSv1.2' }
 });
 
-// IMPORTANT : l’adresse d’envoi est toujours alignée sur SMTP_USER (évite 530)
+// Expéditeur = MAIL_USER pour éviter 530 ; nom = MAIL_FROM_NAME
 async function sendMail({ to, cc = [], subject, html }) {
   const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
   const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
-
-  const fromEmail = SMTP_USER; // adresse Gmail authentifiée
-  const fromName  = MAIL_FROM_NAME;
+  const fromEmail = MAIL_USER;
 
   return transporter.sendMail({
-    from: `"${fromName}" <${fromEmail}>`,
+    from: `"${MAIL_FROM_NAME}" <${fromEmail}>`,
     to: toList.join(', '),
     cc: ccList.join(', '),
     subject,
     html,
-    envelope: {
-      from: fromEmail,
-      to: [...toList, ...ccList],
-    },
+    envelope: { from: fromEmail, to: [...toList, ...ccList] },
   });
 }
 
 transporter.verify()
-  .then(() => console.log(`📮 SMTP ready (smtp.gmail.com:587 STARTTLS) FROM=${MAIL_FROM_NAME} <${SMTP_USER}>`))
-  .catch(e => console.error('📮 SMTP verify failed:', e?.message || e));
+  .then(() => console.log(`📮 MAIL ready (${MAIL_HOST}:${MAIL_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_USER || 'MISSING'}>`))
+  .catch(e => {
+    console.error('📮 MAIL verify failed:', e?.message || e);
+    console.error('👉 Pour Gmail : MAIL_HOST=smtp.gmail.com, MAIL_PORT=587, app password 16 chars (sans espaces).');
+  });
 
 // ====== Seed admins (1re exécution) ======
 mongoose.connection.on('connected', async () => {
@@ -240,8 +218,8 @@ mongoose.connection.on('connected', async () => {
 // ====== Health / Debug ======
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 app.get('/api/mail-verify', async (req,res) => {
-  try { await transporter.verify(); res.json({ ok:true, host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, from: `${MAIL_FROM_NAME} <${SMTP_USER}>` }); }
-  catch(e){ res.status(500).json({ ok:false, error:e.message, host:SMTP_HOST, port:SMTP_PORT, secure: SMTP_SECURE }); }
+  try { await transporter.verify(); res.json({ ok:true, host: MAIL_HOST, port: MAIL_PORT, from: `${MAIL_FROM_NAME} <${MAIL_USER}>` }); }
+  catch(e){ res.status(500).json({ ok:false, error:e.message, host:MAIL_HOST, port:MAIL_PORT }); }
 });
 
 // ====== Auth ======
@@ -325,8 +303,7 @@ app.get('/api/requests', authRequired, async (req,res) => {
   });
 });
 
-// Validation (envoi signé par l’admin connecté)
-// TO = manager + RH + Reine + Chrystelle ; CC = demandeur uniquement (pas les valideurs)
+// Validation (TO = manager + RH + Reine + Chrystelle ; CC = demandeur uniquement)
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -421,7 +398,7 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Relances quotidiennes (à déclencher via Cron Render à 08:00 Europe/Paris)
+// Relances quotidiennes (Cron Render à 08:00 Europe/Paris)
 app.post('/internal/cron/reminders', async (req,res) => {
   if (CRON_SECRET && req.query.token !== CRON_SECRET) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -458,4 +435,5 @@ app.post('/internal/cron/reminders', async (req,res) => {
 
 // ====== Start ======
 app.listen(PORT, () => console.log(`🚀 API listening on port ${PORT}`));
+
 
