@@ -1,5 +1,6 @@
-// server.js — Backend production-ready (Mongo + JWT + SMTP/Mailtrap + Alertes + Relances quotidiennes)
+// server.js — Backend production-ready (Mongo + JWT + SMTP + Alertes + Relances quotidiennes)
 // Dernières modifs : FROM pris depuis ENV (MAIL_FROM / MAIL_FROM_NAME) + signatures perso
+// Patch Gmail : lecture des variables MAIL_* (MAIL_HOST/PORT/USER/PASS) — supprime le fallback Mailtrap
 
 const express = require('express');
 const cors = require('cors');
@@ -16,13 +17,13 @@ const {
   APP_BASE_URL = 'http://localhost:5173',
   CRON_SECRET,
 
-  // SMTP prioritaire (sinon fallback Mailtrap si défini)
-  SMTP_HOST = process.env.SMTP_HOST || process.env.MAILTRAP_HOST || 'sandbox.smtp.mailtrap.io',
-  SMTP_PORT = Number(process.env.SMTP_PORT || process.env.MAILTRAP_PORT || 2525),
-  SMTP_USER = process.env.SMTP_USER || process.env.MAILTRAP_USER,
-  SMTP_PASS = process.env.SMTP_PASS || process.env.MAILTRAP_PASS,
+  // 👉 SMTP via Gmail : utiliser les variables MAIL_* définies sur Render
+  MAIL_HOST = process.env.MAIL_HOST,                 // ex: smtp.gmail.com
+  MAIL_PORT = Number(process.env.MAIL_PORT || 587),  // 587 (STARTTLS) ou 465 (SSL)
+  MAIL_USER = process.env.MAIL_USER,                 // ex: detachements.cgtsg@gmail.com
+  MAIL_PASS = process.env.MAIL_PASS,                 // mot de passe d'application (sans espaces)
 
-  // Émetteur d’e-mail (PRIS depuis ENV ; défaut raisonnable)
+  // Émetteur d’e-mail (depuis ENV)
   MAIL_FROM = process.env.MAIL_FROM || 'no-reply@csec-sg.com',
   MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'CSEC SG - Détachements',
 
@@ -99,16 +100,17 @@ const RequestSchema = new mongoose.Schema({
 const Admin = mongoose.model('Admin', AdminSchema);
 const Request = mongoose.model('Request', RequestSchema);
 
-// ====== Mailer (SMTP / Mailtrap) ======
+// ====== Mailer (SMTP Gmail via MAIL_*) ======
 const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+  host: MAIL_HOST,                   // smtp.gmail.com
+  port: MAIL_PORT,                   // 587 ou 465
+  secure: Number(MAIL_PORT) === 465, // true si 465 (SSL), sinon STARTTLS
+  auth: MAIL_USER && MAIL_PASS ? { user: MAIL_USER, pass: MAIL_PASS } : undefined,
 });
 
 async function sendMail({ to, cc = [], subject, html }) {
   return transporter.sendMail({
-    from: `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`, // ← maintenant depuis ENV
+    from: `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`,
     to: Array.isArray(to) ? to.join(', ') : to,
     cc: Array.isArray(cc) ? cc.join(', ') : cc,
     subject,
@@ -117,7 +119,7 @@ async function sendMail({ to, cc = [], subject, html }) {
 }
 
 transporter.verify()
-  .then(() => console.log(`📮 SMTP ready (${SMTP_HOST}:${SMTP_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_FROM}>`))
+  .then(() => console.log(`📮 SMTP ready (${MAIL_HOST}:${MAIL_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_FROM}>`))
   .catch(e => console.error('📮 SMTP verify failed:', e?.message || e));
 
 // ====== Utils ======
@@ -188,8 +190,8 @@ mongoose.connection.on('connected', async () => {
 // ====== Health / Debug ======
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 app.get('/api/mail-verify', async (req,res) => {
-  try { await transporter.verify(); res.json({ ok:true, host: SMTP_HOST, port: SMTP_PORT, from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` }); }
-  catch(e){ res.status(500).json({ ok:false, error:e.message, host:SMTP_HOST, port:SMTP_PORT }); }
+  try { await transporter.verify(); res.json({ ok:true, host: MAIL_HOST, port: MAIL_PORT, from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` }); }
+  catch(e){ res.status(500).json({ ok:false, error:e.message, host:MAIL_HOST, port:MAIL_PORT }); }
 });
 
 // ====== Auth ======
@@ -213,7 +215,6 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
 });
 
 // ====== Requests ======
-// Création ➜ notifie les admins
 app.post('/api/requests', async (req,res) => {
   const b = req.body || {};
   const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
