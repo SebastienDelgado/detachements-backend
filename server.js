@@ -1,6 +1,6 @@
-// server.js — Backend production-ready (Mongo + JWT + SMTP/Mailtrap + Alertes + Relances quotidiennes)
-// Dernières modifs : FROM pris depuis ENV (MAIL_FROM / MAIL_FROM_NAME) + signatures perso
-// Patch: compat id (_id -> id) + contrôle d'ObjectId sur routes /:id
+// server.js — Backend (Mongo + JWT + SMTP Gmail + Alertes + Relances quotidiennes)
+// Gmail (app password) sur smtp.gmail.com:587 STARTTLS
+// Patches inclus : compat id (_id -> id) + contrôle d'ObjectId
 
 const express = require('express');
 const cors = require('cors');
@@ -17,15 +17,16 @@ const {
   APP_BASE_URL = 'http://localhost:5173',
   CRON_SECRET,
 
-  // SMTP prioritaire (sinon fallback Mailtrap si défini)
-  SMTP_HOST = process.env.SMTP_HOST || process.env.MAILTRAP_HOST || 'sandbox.smtp.mailtrap.io',
-  SMTP_PORT = Number(process.env.SMTP_PORT || process.env.MAILTRAP_PORT || 2525),
-  SMTP_USER = process.env.SMTP_USER || process.env.MAILTRAP_USER,
-  SMTP_PASS = process.env.SMTP_PASS || process.env.MAILTRAP_PASS,
+  // === SMTP (GMAIL) ===
+  SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com',
+  SMTP_PORT = Number(process.env.SMTP_PORT || 587),     // 👈 Gmail: 587
+  SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true' ? true : false, // 👈 false (STARTTLS)
+  SMTP_USER,    // ex: detachements.art21.csecsg@gmail.com
+  SMTP_PASS,    // app password (16 chars sans espaces)
 
-  // Émetteur d’e-mail (PRIS depuis ENV ; défaut raisonnable)
-  MAIL_FROM = process.env.MAIL_FROM || 'detachements.cgtsg.art21.csec@gmail.com',
-  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'CGT SG - Détachements',
+  // Émetteur (depuis ENV)
+  MAIL_FROM = process.env.MAIL_FROM || (SMTP_USER ? SMTP_USER : 'no-reply@example.com'),
+  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 
   // CORS (liste d’origines séparées par des virgules)
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
@@ -34,6 +35,9 @@ const {
 if (!MONGODB_URI || !JWT_SECRET) {
   console.error('❌ Missing ENV: MONGODB_URI or JWT_SECRET');
   process.exit(1);
+}
+if (!SMTP_USER || !SMTP_PASS) {
+  console.warn('⚠️ SMTP_USER / SMTP_PASS non définis : l’envoi d’e-mails échouera.');
 }
 
 // ====== APP & CORS ======
@@ -48,7 +52,7 @@ app.use(cors({
     if (!origin) return cb(null, true);
     if (allowedOrigins.length === 0) return cb(null, true); // open
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(null, true); // en prod, tu peux refuser: cb(new Error('Not allowed'), false)
+    return cb(null, true); // en prod tu peux restreindre : cb(new Error('Not allowed'), false)
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Accept'],
@@ -92,41 +96,16 @@ const RequestSchema = new mongoose.Schema({
   hr_email: String,
   status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
   created_at: { type: Date, default: () => new Date() },
-
-  // Relance quotidienne (éviter doublons dans la même journée Europe/Paris)
   reminder_last_sent_on: String, // "YYYY-MM-DD"
 }, { timestamps: true });
 
 const Admin = mongoose.model('Admin', AdminSchema);
 const Request = mongoose.model('Request', RequestSchema);
 
-// ====== Helper: contrôle d'ObjectId ======
+// ====== Helpers ======
 function isValidId(id) {
   return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id);
 }
-
-// ====== Mailer (SMTP / Mailtrap) ======
-const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-});
-
-async function sendMail({ to, cc = [], subject, html }) {
-  return transporter.sendMail({
-    from: `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`, // ← depuis ENV
-    to: Array.isArray(to) ? to.join(', ') : to,
-    cc: Array.isArray(cc) ? cc.join(', ') : cc,
-    subject,
-    html,
-  });
-}
-
-transporter.verify()
-  .then(() => console.log(`📮 SMTP ready (${SMTP_HOST}:${SMTP_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_FROM}>`))
-  .catch(e => console.error('📮 SMTP verify failed:', e?.message || e));
-
-// ====== Utils ======
 function signToken(admin) {
   return jwt.sign({ sub: admin._id.toString(), name: admin.name, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
 }
@@ -175,6 +154,27 @@ function getSignTitle(email) {
   return 'CSEC SG';
 }
 
+// ====== Mailer (Gmail) ======
+const transporter = nodemailer.createTransport({
+  host: SMTP_HOST,          // 'smtp.gmail.com'
+  port: SMTP_PORT,          // 587
+  secure: SMTP_SECURE,      // false (STARTTLS)
+  auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+  requireTLS: true,         // force STARTTLS
+});
+async function sendMail({ to, cc = [], subject, html }) {
+  return transporter.sendMail({
+    from: `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`,
+    to: Array.isArray(to) ? to.join(', ') : to,
+    cc: Array.isArray(cc) ? cc.join(', ') : cc,
+    subject,
+    html,
+  });
+}
+transporter.verify()
+  .then(() => console.log(`📮 SMTP ready (smtp.gmail.com:587 STARTTLS) FROM=${MAIL_FROM_NAME} <${MAIL_FROM}>`))
+  .catch(e => console.error('📮 SMTP verify failed:', e?.message || e));
+
 // ====== Seed admins (1re exécution) ======
 mongoose.connection.on('connected', async () => {
   const existing = await Admin.find({}).lean();
@@ -194,8 +194,8 @@ mongoose.connection.on('connected', async () => {
 // ====== Health / Debug ======
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 app.get('/api/mail-verify', async (req,res) => {
-  try { await transporter.verify(); res.json({ ok:true, host: SMTP_HOST, port: SMTP_PORT, from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` }); }
-  catch(e){ res.status(500).json({ ok:false, error:e.message, host:SMTP_HOST, port:SMTP_PORT }); }
+  try { await transporter.verify(); res.json({ ok:true, host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` }); }
+  catch(e){ res.status(500).json({ ok:false, error:e.message, host:SMTP_HOST, port:SMTP_PORT, secure: SMTP_SECURE }); }
 });
 
 // ====== Auth ======
@@ -307,9 +307,9 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
     <p><strong>${req.admin.name}</strong><br/>${signTitle}</p>
   `;
 
-  // TO = manager + RH + Reine + Chrystelle ; CC = demandeur + Sébastien + Ludivine
+  // TO = manager + RH + Reine + Chrystelle ; CC = demandeur + (pas de valideurs en copie)
   const TO = [rec.manager_email, rec.hr_email, 'reine.allaglo@csec-sg.com', 'chrystelle.agea@socgen.com'].filter(Boolean);
-  const CC = [rec.applicant_email, 'sebastien.delgado@csec-sg.com', 'ludivine.perreaut@gmail.com'].filter(Boolean);
+  const CC = [rec.applicant_email].filter(Boolean);
 
   try { await sendMail({ to: TO, cc: CC, subject, html }); }
   catch(e){ console.error('Mail validate err:', e?.message || e); }
