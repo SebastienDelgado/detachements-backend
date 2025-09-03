@@ -26,8 +26,8 @@ const {
   MAIL_PASS = process.env.MAIL_PASS,                 // mot de passe d'application (sans espaces)
 
   // Émetteur d’e-mail (PRIS depuis ENV ; défaut conservé)
-  MAIL_FROM = process.env.MAIL_FROM || 'no-reply@csec-sg.com',
-  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'CSEC SG - Détachements',
+  MAIL_FROM = process.env.MAIL_FROM || 'detachements.cgtsg.art21.csec@gmail.com',
+  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'CGT SG - Détachements',
 
   // CORS (liste d’origines séparées par des virgules)
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
