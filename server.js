@@ -1,8 +1,6 @@
-// server.js — Backend production-ready (Mongo + JWT + SMTP Gmail + Alertes + Relances quotidiennes)
-// PATCHS MINIMAUX :
-// - Remplace Mailtrap/SMTP_* par Gmail via MAIL_*
-// - Signatures complètes selon l’admin (Sébastien / Ludivine)
-// - Validation : CC = uniquement le demandeur (plus de valideurs en copie)
+// server.js — Backend production-ready (Mongo + JWT + SMTP/Mailtrap + Alertes + Relances quotidiennes)
+// Dernières modifs : FROM pris depuis ENV (MAIL_FROM / MAIL_FROM_NAME) + signatures perso
+// Patch: compat id (_id -> id) + contrôle d'ObjectId sur routes /:id
 
 const express = require('express');
 const cors = require('cors');
@@ -19,13 +17,13 @@ const {
   APP_BASE_URL = 'http://localhost:5173',
   CRON_SECRET,
 
-  // 👉 SMTP Gmail (production)
-  MAIL_HOST = process.env.MAIL_HOST,                 // ex: smtp.gmail.com
-  MAIL_PORT = Number(process.env.MAIL_PORT || 587),  // 587 (STARTTLS) recommandé
-  MAIL_USER = process.env.MAIL_USER,                 // ex: detachements...@gmail.com
-  MAIL_PASS = process.env.MAIL_PASS,                 // mot de passe d'application (sans espaces)
+  // SMTP prioritaire (sinon fallback Mailtrap si défini)
+  SMTP_HOST = process.env.SMTP_HOST || process.env.MAILTRAP_HOST || 'sandbox.smtp.mailtrap.io',
+  SMTP_PORT = Number(process.env.SMTP_PORT || process.env.MAILTRAP_PORT || 2525),
+  SMTP_USER = process.env.SMTP_USER || process.env.MAILTRAP_USER,
+  SMTP_PASS = process.env.SMTP_PASS || process.env.MAILTRAP_PASS,
 
-  // Émetteur d’e-mail (PRIS depuis ENV ; défaut conservé)
+  // Émetteur d’e-mail (PRIS depuis ENV ; défaut raisonnable)
   MAIL_FROM = process.env.MAIL_FROM || 'detachements.cgtsg.art21.csec@gmail.com',
   MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'CGT SG - Détachements',
 
@@ -102,12 +100,16 @@ const RequestSchema = new mongoose.Schema({
 const Admin = mongoose.model('Admin', AdminSchema);
 const Request = mongoose.model('Request', RequestSchema);
 
-// ====== Mailer (SMTP Gmail via MAIL_*) ======
+// ====== Helper: contrôle d'ObjectId ======
+function isValidId(id) {
+  return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id);
+}
+
+// ====== Mailer (SMTP / Mailtrap) ======
 const transporter = nodemailer.createTransport({
-  host: MAIL_HOST,
-  port: MAIL_PORT,
-  // on reste minimal : STARTTLS auto sur 587 ; si tu passes à 465, ajoute secure:true
-  auth: MAIL_USER && MAIL_PASS ? { user: MAIL_USER, pass: MAIL_PASS } : undefined,
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
 });
 
 async function sendMail({ to, cc = [], subject, html }) {
@@ -121,7 +123,7 @@ async function sendMail({ to, cc = [], subject, html }) {
 }
 
 transporter.verify()
-  .then(() => console.log(`📮 SMTP ready (${MAIL_HOST}:${MAIL_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_FROM}>`))
+  .then(() => console.log(`📮 SMTP ready (${SMTP_HOST}:${SMTP_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_FROM}>`))
   .catch(e => console.error('📮 SMTP verify failed:', e?.message || e));
 
 // ====== Utils ======
@@ -167,18 +169,10 @@ function todayParisISO() {
   const yyyy = parts.find(p => p.type === 'year').value;
   return `${yyyy}-${mm}-${dd}`;
 }
-
-// ——— Signature complète selon l’admin ———
-function signatureHtml(admin) {
-  const email = (admin && admin.email) || '';
-  if (email === 'sebastien.delgado@csec-sg.com') {
-    return `<p><strong>Sébastien DELGADO</strong><br/>Secrétaire Adjoint du CSEC SG<br/>sebastien.delgado@csec-sg.com<br/>0674984868</p>`;
-  }
-  if (email === 'ludivine.perreaut@gmail.com') {
-    return `<p><strong>Ludivine PERREAUT</strong><br/>Représentante Syndicale Nationale CGT<br/>Ludivine.perreaut@gmail.com<br/>0682838484</p>`;
-  }
-  // fallback
-  return `<p><strong>${(admin && admin.name) || 'CSEC SG'}</strong><br/>CSEC SG</p>`;
+function getSignTitle(email) {
+  if (email === 'sebastien.delgado@csec-sg.com') return 'Secrétaire Adjoint du CSEC SG';
+  if (email === 'ludivine.perreaut@gmail.com') return 'Représentante Syndicale Nationale CGT';
+  return 'CSEC SG';
 }
 
 // ====== Seed admins (1re exécution) ======
@@ -200,8 +194,8 @@ mongoose.connection.on('connected', async () => {
 // ====== Health / Debug ======
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 app.get('/api/mail-verify', async (req,res) => {
-  try { await transporter.verify(); res.json({ ok:true, host: MAIL_HOST, port: MAIL_PORT, from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` }); }
-  catch(e){ res.status(500).json({ ok:false, error:e.message, host:MAIL_HOST, port:MAIL_PORT }); }
+  try { await transporter.verify(); res.json({ ok:true, host: SMTP_HOST, port: SMTP_PORT, from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` }); }
+  catch(e){ res.status(500).json({ ok:false, error:e.message, host:SMTP_HOST, port:SMTP_PORT }); }
 });
 
 // ====== Auth ======
@@ -271,21 +265,31 @@ app.post('/api/requests', async (req,res) => {
   return res.json({ ok: true, id: rec._id.toString() });
 });
 
-// Liste
+// Liste (normalisée avec id)
 app.get('/api/requests', authRequired, async (req,res) => {
   const status = (req.query.status || '').toLowerCase();
   const q = status ? { status } : {};
   const items = await Request.find(q).sort({ created_at: -1 }).lean();
-  return res.json({ items });
+  return res.json({
+    items: (items || []).map(x => ({
+      ...x,
+      id: (x._id || x.id || '').toString(),
+      _id: undefined
+    }))
+  });
 });
 
 // Validation (envoi signé par l’admin connecté)
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
-  const rec = await Request.findById(req.params.id);
+  const { id } = req.params;
+  if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  const rec = await Request.findById(id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
 
   rec.status = 'sent'; await rec.save();
 
+  const signTitle = getSignTitle(req.admin.email);
   const subject = `Détachement – ${rec.full_name}`;
   const html = `
     <p>Bonjour,</p>
@@ -298,13 +302,14 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
       En article 21 : <span style="color:#D71620">${rec.type} – ${rec.days} jour(s)</span><br/>
       (Hors délai de route)
     </p>
+    ${rec.comment ? `<p>Commentaire du demandeur : <span style="color:#D71620">${rec.comment}</span></p>` : ''}
     <p>Bonne fin de journée,</p>
-    ${signatureHtml(req.admin)}
+    <p><strong>${req.admin.name}</strong><br/>${signTitle}</p>
   `;
 
-  // TO = manager + RH + Reine + Chrystelle ; CC = uniquement le demandeur (plus de valideurs en copie)
+  // TO = manager + RH + Reine + Chrystelle ; CC = demandeur + Sébastien + Ludivine
   const TO = [rec.manager_email, rec.hr_email, 'reine.allaglo@csec-sg.com', 'chrystelle.agea@socgen.com'].filter(Boolean);
-  const CC = [rec.applicant_email].filter(Boolean);
+  const CC = [rec.applicant_email, 'sebastien.delgado@csec-sg.com', 'ludivine.perreaut@gmail.com'].filter(Boolean);
 
   try { await sendMail({ to: TO, cc: CC, subject, html }); }
   catch(e){ console.error('Mail validate err:', e?.message || e); }
@@ -314,12 +319,16 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
 
 // Refus
 app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
-  const rec = await Request.findById(req.params.id);
+  const { id } = req.params;
+  if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  const rec = await Request.findById(id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
 
   const reason = (req.body && req.body.reason) || '';
   rec.status = 'refused'; rec.refuse_reason = reason; await rec.save();
 
+  const signTitle = getSignTitle(req.admin.email);
   const subject = `Refus de détachement – ${rec.full_name}`;
   const html = `
     <p>Bonjour,</p>
@@ -331,7 +340,7 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
     </p>
     ${reason ? `<p>Motif : <em>${reason}</em></p>` : ''}
     <p>Cordialement,</p>
-    ${signatureHtml(req.admin)}
+    <p><strong>${req.admin.name}</strong><br/>${signTitle}</p>
   `;
   try { await sendMail({ to: rec.applicant_email, subject, html }); }
   catch(e){ console.error('Mail refuse err:', e?.message || e); }
@@ -341,12 +350,16 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
 
 // Annulation
 app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
-  const rec = await Request.findById(req.params.id);
+  const { id } = req.params;
+  if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  const rec = await Request.findById(id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
 
   const reason = (req.body && req.body.reason) || '';
   rec.status = 'cancelled'; rec.cancel_reason = reason; await rec.save();
 
+  const signTitle = getSignTitle(req.admin.email);
   const subject = `Annulation de détachement – ${rec.full_name}`;
   const html = `
     <p>Bonjour,</p>
@@ -358,7 +371,7 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
     </p>
     ${reason ? `<p>Motif : <em>${reason}</em></p>` : ''}
     <p>Cordialement,</p>
-    ${signatureHtml(req.admin)}
+    <p><strong>${req.admin.name}</strong><br/>${signTitle}</p>
   `;
   try { await sendMail({ to: rec.applicant_email, subject, html }); }
   catch(e){ console.error('Mail cancel err:', e?.message || e); }
