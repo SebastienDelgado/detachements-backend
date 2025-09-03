@@ -19,7 +19,7 @@ const {
   PORT = 3000,
   MONGODB_URI,
   JWT_SECRET,
-  APP_BASE_URL = 'http://https://cgtsg-detachements-art21-csecsg.netlify.app',
+  APP_BASE_URL = 'https://cgtsg-detachements-art21-csecsg.netlify.app',
   CRON_SECRET,
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
 
