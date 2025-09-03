@@ -1,6 +1,9 @@
-// server.js — Backend production-ready (Mongo + JWT + SMTP + Alertes + Relances quotidiennes)
-// Dernières modifs : FROM pris depuis ENV (MAIL_FROM / MAIL_FROM_NAME) + signatures perso
-// Patch Gmail : lecture des variables MAIL_* (MAIL_HOST/PORT/USER/PASS) — supprime le fallback Mailtrap
+// server.js — Backend (Mongo + JWT + SMTP Gmail + alertes + relances)
+// MAJ demandées :
+// - Validation : ne plus mettre les valideurs en copie (seulement le demandeur en CC)
+// - Dates en français jj/mm/aa
+// - "Du … au …" pour les périodes ; "(matin)" / "(après midi)" pour demi-journée
+// - Signatures complètes selon l’admin valideur
 
 const express = require('express');
 const cors = require('cors');
@@ -9,7 +12,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 
-// ====== ENV ======
 const {
   PORT = 3000,
   MONGODB_URI,
@@ -17,17 +19,17 @@ const {
   APP_BASE_URL = 'http://localhost:5173',
   CRON_SECRET,
 
-  // 👉 SMTP via Gmail : utiliser les variables MAIL_* définies sur Render
-  MAIL_HOST = process.env.MAIL_HOST,                 // ex: smtp.gmail.com
+  // SMTP Gmail (prod)
+  MAIL_HOST = process.env.MAIL_HOST,                 // smtp.gmail.com
   MAIL_PORT = Number(process.env.MAIL_PORT || 587),  // 587 (STARTTLS) ou 465 (SSL)
-  MAIL_USER = process.env.MAIL_USER,                 // ex: detachements.cgtsg@gmail.com
+  MAIL_USER = process.env.MAIL_USER,                 // adresse Gmail
   MAIL_PASS = process.env.MAIL_PASS,                 // mot de passe d'application (sans espaces)
 
-  // Émetteur d’e-mail (depuis ENV)
-  MAIL_FROM = process.env.MAIL_FROM || 'no-reply@csec-sg.com',
-  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'CSEC SG - Détachements',
+  // Expéditeur affiché
+  MAIL_FROM = process.env.MAIL_FROM,                 // doit = MAIL_USER
+  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 
-  // CORS (liste d’origines séparées par des virgules)
+  // CORS
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
 } = process.env;
 
@@ -46,9 +48,9 @@ const allowedOrigins = (CORS_ORIGINS || '')
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    if (allowedOrigins.length === 0) return cb(null, true); // open
+    if (allowedOrigins.length === 0) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(null, true); // en prod, tu peux refuser: cb(new Error('Not allowed'), false)
+    return cb(null, true);
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Accept'],
@@ -92,8 +94,7 @@ const RequestSchema = new mongoose.Schema({
   hr_email: String,
   status: { type: String, default: 'pending' }, // pending | sent | refused | cancelled
   created_at: { type: Date, default: () => new Date() },
-
-  // Relance quotidienne (éviter doublons dans la même journée Europe/Paris)
+  // Relance quotidienne
   reminder_last_sent_on: String, // "YYYY-MM-DD"
 }, { timestamps: true });
 
@@ -136,23 +137,53 @@ async function authRequired(req, res, next) {
     req.admin = admin; next();
   } catch { return res.status(401).json({ error: 'Unauthorized' }); }
 }
+
+// → Format FR court jj/mm/aa
 function toFR(d) {
   if (!d || !/\d{4}-\d{2}-\d{2}/.test(d)) return d || '—';
-  const [y,m,dd] = d.split('-'); return `${dd}/${m}/${y}`;
+  const [y, m, dd] = d.split('-');
+  const yy = y.slice(2); // deux chiffres
+  return `${dd}/${m}/${yy}`;
 }
+
+// → “Du … au …” pour périodes ; “(matin)” / “(après midi)” pour demi-journées
 function datePhrase(rec) {
-  const a = rec.date_from, b = rec.date_to, sp = (rec.start_period||'FULL').toUpperCase(), ep = (rec.end_period||'FULL').toUpperCase();
-  const A = toFR(a), B = toFR(b || a);
+  const a = rec.date_from;
+  const b = rec.date_to;
+  const sp = (rec.start_period || 'FULL').toUpperCase();
+  const ep = (rec.end_period   || 'FULL').toUpperCase();
+  const A = toFR(a);
+  const B = toFR(b || a);
+
+  // Même jour
   if (!b || a === b) {
-    if (sp === 'AM' && ep === 'AM') return `${A} (Matin)`;
-    if (sp === 'PM' && ep === 'PM') return `${A} (Après-midi)`;
+    if (sp === 'AM' && ep === 'AM') return `${A} (matin)`;
+    if (sp === 'PM' && ep === 'PM') return `${A} (après midi)`;
+    // cas où FULL ou AM→PM sur la même journée
     return `${A}`;
   }
+
+  // Plage multi-jours
   const tail = [];
-  if (sp === 'PM') tail.push('Début : Après-midi');
-  if (ep === 'AM') tail.push('Fin : Matin');
+  if (sp === 'PM') tail.push('Début : après midi');
+  if (ep === 'AM') tail.push('Fin : matin');
   return `Du ${A} au ${B}${tail.length ? ' — ' + tail.join(', ') : ''}`;
 }
+
+// Signature complète selon l’admin
+function signatureHtml(admin) {
+  if (!admin) return '';
+  const email = admin.email || '';
+  if (email === 'sebastien.delgado@csec-sg.com') {
+    return `<p><strong>Sébastien DELGADO</strong><br/>Secrétaire Adjoint du CSEC SG<br/>sebastien.delgado@csec-sg.com<br/>0674984868</p>`;
+  }
+  if (email === 'ludivine.perreaut@gmail.com') {
+    return `<p><strong>Ludivine PERREAUT</strong><br/>Représentante Syndicale Nationale CGT<br/>Ludivine.perreaut@gmail.com<br/>0682838484</p>`;
+  }
+  // fallback
+  return `<p><strong>${admin.name || 'CSEC SG'}</strong><br/>CSEC SG</p>`;
+}
+
 function todayParisISO() {
   const parts = new Intl.DateTimeFormat('fr-FR', {
     timeZone: 'Europe/Paris',
@@ -164,11 +195,6 @@ function todayParisISO() {
   const mm = parts.find(p => p.type === 'month').value;
   const yyyy = parts.find(p => p.type === 'year').value;
   return `${yyyy}-${mm}-${dd}`;
-}
-function getSignTitle(email) {
-  if (email === 'sebastien.delgado@csec-sg.com') return 'Secrétaire Adjoint du CSEC SG';
-  if (email === 'ludivine.perreaut@gmail.com') return 'Représentante Syndicale Nationale CGT';
-  return 'CSEC SG';
 }
 
 // ====== Seed admins (1re exécution) ======
@@ -238,6 +264,7 @@ app.post('/api/requests', async (req,res) => {
     created_at: new Date(),
   });
 
+  // Alerte aux admins
   try {
     const admins = await Admin.find({}).lean();
     const adminEmails = admins.map(a => a.email);
@@ -260,7 +287,7 @@ app.post('/api/requests', async (req,res) => {
   return res.json({ ok: true, id: rec._id.toString() });
 });
 
-// Liste
+// Liste (par statut)
 app.get('/api/requests', authRequired, async (req,res) => {
   const status = (req.query.status || '').toLowerCase();
   const q = status ? { status } : {};
@@ -268,14 +295,14 @@ app.get('/api/requests', authRequired, async (req,res) => {
   return res.json({ items });
 });
 
-// Validation (envoi signé par l’admin connecté)
+// ====== Validation ======
+// TO: manager + RH + Reine + Chrystelle ; CC: uniquement le demandeur (⚠️ plus de valideurs en copie)
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
 
   rec.status = 'sent'; await rec.save();
 
-  const signTitle = getSignTitle(req.admin.email);
   const subject = `Détachement – ${rec.full_name}`;
   const html = `
     <p>Bonjour,</p>
@@ -290,12 +317,11 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
     </p>
     ${rec.comment ? `<p>Commentaire du demandeur : <span style="color:#D71620">${rec.comment}</span></p>` : ''}
     <p>Bonne fin de journée,</p>
-    <p><strong>${req.admin.name}</strong><br/>${signTitle}</p>
+    ${signatureHtml(req.admin)}
   `;
 
-  // TO = manager + RH + Reine + Chrystelle ; CC = demandeur + Sébastien + Ludivine
   const TO = [rec.manager_email, rec.hr_email, 'reine.allaglo@csec-sg.com', 'chrystelle.agea@socgen.com'].filter(Boolean);
-  const CC = [rec.applicant_email, 'sebastien.delgado@csec-sg.com', 'ludivine.perreaut@gmail.com'].filter(Boolean);
+  const CC = [rec.applicant_email].filter(Boolean); // ← seulement le demandeur en copie
 
   try { await sendMail({ to: TO, cc: CC, subject, html }); }
   catch(e){ console.error('Mail validate err:', e?.message || e); }
@@ -303,7 +329,7 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Refus
+// ====== Refus ====== (mail au demandeur) — avec récap + signature complète
 app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -311,7 +337,6 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   const reason = (req.body && req.body.reason) || '';
   rec.status = 'refused'; rec.refuse_reason = reason; await rec.save();
 
-  const signTitle = getSignTitle(req.admin.email);
   const subject = `Refus de détachement – ${rec.full_name}`;
   const html = `
     <p>Bonjour,</p>
@@ -323,7 +348,7 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
     </p>
     ${reason ? `<p>Motif : <em>${reason}</em></p>` : ''}
     <p>Cordialement,</p>
-    <p><strong>${req.admin.name}</strong><br/>${signTitle}</p>
+    ${signatureHtml(req.admin)}
   `;
   try { await sendMail({ to: rec.applicant_email, subject, html }); }
   catch(e){ console.error('Mail refuse err:', e?.message || e); }
@@ -331,7 +356,7 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Annulation
+// ====== Annulation ====== (mail au demandeur) — avec récap + signature complète
 app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   const rec = await Request.findById(req.params.id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -339,7 +364,6 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   const reason = (req.body && req.body.reason) || '';
   rec.status = 'cancelled'; rec.cancel_reason = reason; await rec.save();
 
-  const signTitle = getSignTitle(req.admin.email);
   const subject = `Annulation de détachement – ${rec.full_name}`;
   const html = `
     <p>Bonjour,</p>
@@ -351,7 +375,7 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
     </p>
     ${reason ? `<p>Motif : <em>${reason}</em></p>` : ''}
     <p>Cordialement,</p>
-    <p><strong>${req.admin.name}</strong><br/>${signTitle}</p>
+    ${signatureHtml(req.admin)}
   `;
   try { await sendMail({ to: rec.applicant_email, subject, html }); }
   catch(e){ console.error('Mail cancel err:', e?.message || e); }
@@ -359,7 +383,7 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Relances quotidiennes (à déclencher via Cron Render à 08:00 Europe/Paris)
+// Relances quotidiennes (Cron Render 08:00 Europe/Paris)
 app.post('/internal/cron/reminders', async (req,res) => {
   if (CRON_SECRET && req.query.token !== CRON_SECRET) {
     return res.status(403).json({ error: 'Forbidden' });
