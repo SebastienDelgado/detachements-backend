@@ -298,7 +298,6 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
       En article 21 : <span style="color:#D71620">${rec.type} – ${rec.days} jour(s)</span><br/>
       (Hors délai de route)
     </p>
-    ${rec.comment ? `<p>Commentaire du demandeur : <span style="color:#D71620">${rec.comment}</span></p>` : ''}
     <p>Bonne fin de journée,</p>
     ${signatureHtml(req.admin)}
   `;
