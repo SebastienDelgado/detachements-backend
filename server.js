@@ -1,17 +1,25 @@
-// server.js — Backend (Mongo + JWT + Emails via Resend ou Gmail SMTP + Alertes + Relances quotidiennes)
-// Variables attendues :
-// - MONGODB_URI, JWT_SECRET, APP_BASE_URL, CRON_SECRET, CORS_ORIGINS
-// - MAIL_PROVIDER = "resend" | "gmail"
-//   • Si "resend": RESEND_API_KEY, MAIL_FROM_NAME (le from est forcé à onboarding@resend.dev tant que pas de domaine vérifié)
-//   • Si "gmail" : MAIL_HOST=smtp.gmail.com, MAIL_PORT=587, MAIL_USER, MAIL_PASS, MAIL_FROM_NAME
+// server.js — Backend (Mongo + JWT + Brevo SMTP + Alertes + Relances quotidiennes)
+// SMTP Brevo : host=smtp-relay.brevo.com, port=587, user=<SMTP Key>, pass=<SMTP Key>
+// Variables d'env requises :
+// - MONGODB_URI
+// - JWT_SECRET
+// - APP_BASE_URL (ex: https://cgtsg-detachements-art21-csecsg.netlify.app)
+// - CORS_ORIGINS (optionnel, CSV ; défaut = APP_BASE_URL)
+// - CRON_SECRET (optionnel pour /internal/cron/reminders)
+// - MAIL_HOST = smtp-relay.brevo.com
+// - MAIL_PORT = 587
+// - MAIL_USER = <ta SMTP Key Brevo>   (oui, la clé sert d'user)
+// - MAIL_PASS = <ta SMTP Key Brevo>   (oui, la même clé sert de pass)
+// - MAIL_FROM = <adresse expéditrice validée dans Brevo, ex: detachements...@gmail.com>
+// - MAIL_FROM_NAME = Détachements CGT-SG Article 21 CSEC-SG
 
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 
-// ====== ENV ======
 const {
   PORT = 3000,
   MONGODB_URI,
@@ -20,19 +28,11 @@ const {
   CRON_SECRET,
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
 
-  // Provider e-mails
-  MAIL_PROVIDER = (process.env.MAIL_PROVIDER || 'resend').toLowerCase(),
-
-  // Resend
-  RESEND_API_KEY,
-
-  // Gmail SMTP
-  MAIL_HOST = process.env.MAIL_HOST || 'smtp.gmail.com',
+  MAIL_HOST = process.env.MAIL_HOST || 'smtp-relay.brevo.com',
   MAIL_PORT = Number(process.env.MAIL_PORT || 587),
-  MAIL_USER = process.env.MAIL_USER || '',
-  MAIL_PASS = process.env.MAIL_PASS || '',
-
-  // Nom d’expéditeur (affiché côté destinataires)
+  MAIL_USER = process.env.MAIL_USER || '', // Brevo SMTP key
+  MAIL_PASS = process.env.MAIL_PASS || '', // Brevo SMTP key (même valeur)
+  MAIL_FROM = process.env.MAIL_FROM || '', // adresse validée dans Brevo (ex: ton Gmail)
   MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 } = process.env;
 
@@ -41,19 +41,14 @@ if (!MONGODB_URI || !JWT_SECRET) {
   process.exit(1);
 }
 
-// ====== APP & CORS ======
+// ---- APP & CORS ----
 const app = express();
-const allowedOrigins = (CORS_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
+const allowedOrigins = (CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    if (allowedOrigins.length === 0) return cb(null, true);
-    if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(null, true); // si tu veux restreindre en prod: cb(new Error('Not allowed'), false)
+    if (!allowedOrigins.length || allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(null, true); // ouvre large pour éviter les blocages de test
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Accept'],
@@ -61,7 +56,7 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-// ====== DB ======
+// ---- DB ----
 mongoose.set('strictQuery', true);
 async function connectWithRetry() {
   try {
@@ -74,7 +69,7 @@ async function connectWithRetry() {
 }
 connectWithRetry();
 
-// ====== Schemas ======
+// ---- Schemas ----
 const AdminSchema = new mongoose.Schema({
   email: { type: String, unique: true, required: true },
   name:  { type: String, required: true },
@@ -85,8 +80,8 @@ const RequestSchema = new mongoose.Schema({
   full_name: String,
   applicant_email: String,
   entity: String,
-  date_from: String, // yyyy-mm-dd
-  date_to: String,   // yyyy-mm-dd
+  date_from: String,
+  date_to: String,
   start_period: { type: String, default: 'FULL' }, // FULL | AM | PM
   end_period:   { type: String, default: 'FULL' }, // FULL | AM | PM
   place: String,
@@ -103,10 +98,8 @@ const RequestSchema = new mongoose.Schema({
 const Admin = mongoose.model('Admin', AdminSchema);
 const Request = mongoose.model('Request', RequestSchema);
 
-// ====== Helpers ======
-function isValidId(id) {
-  return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id);
-}
+// ---- Helpers ----
+function isValidId(id) { return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id); }
 function signToken(admin) {
   return jwt.sign({ sub: admin._id.toString(), name: admin.name, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
 }
@@ -124,7 +117,7 @@ function toFR(d) {
   if (!d || !/\d{4}-\d{2}-\d{2}/.test(d)) return d || '—';
   const [y,m,dd] = d.split('-'); return `${dd}/${m}/${y}`;
 }
-// Dates avec logique AM/PM demandée
+// Dates FR avec AM/PM
 function datePhrase(rec) {
   const a = rec.date_from;
   const b = rec.date_to || rec.date_from;
@@ -159,79 +152,48 @@ function getSignTitle(email) {
   return 'CSEC SG';
 }
 function getSignatureHtml(admin) {
-  const title = getSignTitle(admin.email);
   if (admin.email === 'sebastien.delgado@csec-sg.com') {
     return `<p><strong>Sébastien DELGADO</strong><br/>Secrétaire Adjoint du CSEC SG<br/>sebastien.delgado@csec-sg.com<br/>06 74 98 48 68</p>`;
   }
   if (admin.email === 'ludivine.perreaut@gmail.com') {
     return `<p><strong>Ludivine PERREAUT</strong><br/>Représentante Syndicale Nationale CGT<br/>ludivine.perreaut@gmail.com<br/>06 82 83 84 84</p>`;
   }
+  const title = getSignTitle(admin.email);
   return `<p><strong>${admin.name}</strong><br/>${title}</p>`;
 }
 
-// ====== Mailer (Resend OU Gmail) ======
-let sendMail; // fonction d’envoi finale
-let MAIL_FROM_EFFECTIVE = ''; // pour logs et /api/mail-verify
+// ---- Mailer (Brevo SMTP) ----
+if (!MAIL_HOST || !MAIL_PORT || !MAIL_USER || !MAIL_PASS || !MAIL_FROM) {
+  console.warn('⚠️ MAIL_* incomplets : MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASS, MAIL_FROM doivent être définis.');
+}
+console.log(`✉️  MAIL -> host=${MAIL_HOST} port=${MAIL_PORT} from="${MAIL_FROM_NAME}" <${MAIL_FROM}> user=${MAIL_USER ? '[set]' : 'MISSING'}`);
 
-if (MAIL_PROVIDER === 'resend') {
-  const { Resend } = require('resend');
-  const resend = new Resend(RESEND_API_KEY);
-  // tant que pas de domaine vérifié Resend, il faut utiliser onboarding@resend.dev
-  const RESEND_FROM = 'onboarding@resend.dev';
-  MAIL_FROM_EFFECTIVE = `${MAIL_FROM_NAME} <${RESEND_FROM}>`;
+const transporter = nodemailer.createTransport({
+  host: MAIL_HOST,       // smtp-relay.brevo.com
+  port: MAIL_PORT,       // 587
+  secure: false,         // STARTTLS
+  auth: { user: MAIL_USER, pass: MAIL_PASS },
+  requireTLS: true,
+  tls: { minVersion: 'TLSv1.2' }
+});
 
-  sendMail = async ({ to, cc = [], subject, html }) => {
-    const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
-    const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
-    try {
-      const resp = await resend.emails.send({
-        from: MAIL_FROM_EFFECTIVE,
-        to: toList,
-        cc: ccList,
-        subject,
-        html,
-      });
-      return resp;
-    } catch (e) {
-      console.error('Resend send error:', e?.message || e);
-      if (e?.response?.data) console.error('Resend response:', e.response.data);
-      throw e;
-    }
-  };
-  console.log(`📬 MAIL provider = Resend | FROM = ${MAIL_FROM_EFFECTIVE}`);
-
-} else {
-  // Gmail SMTP
-  const nodemailer = require('nodemailer');
-  const transporter = nodemailer.createTransport({
-    host: MAIL_HOST,
-    port: MAIL_PORT,
-    secure: false,        // 587 = STARTTLS
-    requireTLS: true,
-    auth: { user: MAIL_USER, pass: MAIL_PASS },
-    tls: { minVersion: 'TLSv1.2' },
+async function sendMail({ to, cc = [], subject, html }) {
+  const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
+  const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
+  return transporter.sendMail({
+    from: `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`,
+    to: toList.join(', '),
+    cc: ccList.join(', '),
+    subject,
+    html
   });
-  MAIL_FROM_EFFECTIVE = `${MAIL_FROM_NAME} <${MAIL_USER}>`;
-
-  sendMail = async ({ to, cc = [], subject, html }) => {
-    const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
-    const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
-    return transporter.sendMail({
-      from: MAIL_FROM_EFFECTIVE,
-      to: toList.join(', '),
-      cc: ccList.join(', '),
-      subject,
-      html,
-      envelope: { from: MAIL_USER, to: [...toList, ...ccList] },
-    });
-  };
-
-  transporter.verify()
-    .then(() => console.log(`📬 MAIL provider = Gmail | FROM = ${MAIL_FROM_EFFECTIVE}`))
-    .catch(e => console.error('Gmail verify failed:', e?.message || e));
 }
 
-// ====== Seed admins (1re exécution) ======
+transporter.verify()
+  .then(() => console.log(`📮 SMTP ready (${MAIL_HOST}:${MAIL_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_FROM}>`))
+  .catch(e => console.error('📮 SMTP verify failed:', e?.message || e));
+
+// ---- Seed admins (1re connexion) ----
 mongoose.connection.on('connected', async () => {
   const existing = await Admin.find({}).lean();
   if (existing.length) return;
@@ -247,15 +209,18 @@ mongoose.connection.on('connected', async () => {
   console.log('👥 Admins seeded.');
 });
 
-// ====== Health / Debug ======
+// ---- Health / Debug ----
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 app.get('/api/mail-verify', async (req,res) => {
   try {
-    res.json({ ok:true, provider: MAIL_PROVIDER, from: MAIL_FROM_EFFECTIVE });
-  } catch(e){ res.status(500).json({ ok:false, error:e.message }); }
+    await transporter.verify();
+    res.json({ ok:true, host: MAIL_HOST, port: MAIL_PORT, from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` });
+  } catch(e){
+    res.status(500).json({ ok:false, error:e.message, host:MAIL_HOST, port:MAIL_PORT });
+  }
 });
 
-// ====== Auth ======
+// ---- Auth ----
 app.post('/api/auth/login', async (req,res) => {
   const { email, password } = req.body || {};
   const admin = await Admin.findOne({ email });
@@ -275,8 +240,7 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// ====== Requests ======
-// Création ➜ notifie les admins
+// ---- Requests ----
 app.post('/api/requests', async (req,res) => {
   const b = req.body || {};
   const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
@@ -322,21 +286,16 @@ app.post('/api/requests', async (req,res) => {
   return res.json({ ok: true, id: rec._id.toString() });
 });
 
-// Liste (normalisée avec id)
 app.get('/api/requests', authRequired, async (req,res) => {
   const status = (req.query.status || '').toLowerCase();
   const q = status ? { status } : {};
   const items = await Request.find(q).sort({ created_at: -1 }).lean();
   return res.json({
-    items: (items || []).map(x => ({
-      ...x,
-      id: (x._id || x.id || '').toString(),
-      _id: undefined
-    }))
+    items: (items || []).map(x => ({ ...x, id: (x._id || x.id || '').toString(), _id: undefined }))
   });
 });
 
-// Validation (TO = manager + RH + Reine + Chrystelle ; CC = demandeur uniquement)
+// Validation (TO = manager + RH + Reine + Chrystelle ; CC = demandeur)
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -371,7 +330,7 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Refus (mail au demandeur)
+// Refus
 app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -401,7 +360,7 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Annulation (mail au demandeur)
+// Annulation
 app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -431,7 +390,7 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Relances quotidiennes (Cron Render à 08:00 Europe/Paris)
+// Relances quotidiennes (08:00 Europe/Paris, via Cron Render)
 app.post('/internal/cron/reminders', async (req,res) => {
   if (CRON_SECRET && req.query.token !== CRON_SECRET) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -466,6 +425,5 @@ app.post('/internal/cron/reminders', async (req,res) => {
   return res.json({ ok: true, sent });
 });
 
-// ====== Start ======
+// ---- Start ----
 app.listen(PORT, () => console.log(`🚀 API listening on port ${PORT}`));
-
