@@ -1,12 +1,15 @@
-// server.js — Backend (Mongo + JWT + Mailer switch Resend/Gmail + Alertes + Relances quotidiennes)
+// server.js — Backend (Mongo + JWT + Emails via Resend ou Gmail SMTP + Alertes + Relances quotidiennes)
+// Variables attendues :
+// - MONGODB_URI, JWT_SECRET, APP_BASE_URL, CRON_SECRET, CORS_ORIGINS
+// - MAIL_PROVIDER = "resend" | "gmail"
+//   • Si "resend": RESEND_API_KEY, MAIL_FROM_NAME (le from est forcé à onboarding@resend.dev tant que pas de domaine vérifié)
+//   • Si "gmail" : MAIL_HOST=smtp.gmail.com, MAIL_PORT=587, MAIL_USER, MAIL_PASS, MAIL_FROM_NAME
 
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
-const { Resend } = require('resend');
 
 // ====== ENV ======
 const {
@@ -17,19 +20,20 @@ const {
   CRON_SECRET,
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
 
-  // Sélection du provider d'e-mail: 'resend' (recommandé) ou 'gmail'
-  MAIL_PROVIDER = process.env.MAIL_PROVIDER || 'resend',
+  // Provider e-mails
+  MAIL_PROVIDER = (process.env.MAIL_PROVIDER || 'resend').toLowerCase(),
 
   // Resend
   RESEND_API_KEY,
-  MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev',
-  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 
-  // Gmail (utilisé uniquement si MAIL_PROVIDER='gmail')
+  // Gmail SMTP
   MAIL_HOST = process.env.MAIL_HOST || 'smtp.gmail.com',
   MAIL_PORT = Number(process.env.MAIL_PORT || 587),
   MAIL_USER = process.env.MAIL_USER || '',
   MAIL_PASS = process.env.MAIL_PASS || '',
+
+  // Nom d’expéditeur (affiché côté destinataires)
+  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 } = process.env;
 
 if (!MONGODB_URI || !JWT_SECRET) {
@@ -49,7 +53,7 @@ app.use(cors({
     if (!origin) return cb(null, true);
     if (allowedOrigins.length === 0) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(null, true);
+    return cb(null, true); // si tu veux restreindre en prod: cb(new Error('Not allowed'), false)
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Accept'],
@@ -120,6 +124,7 @@ function toFR(d) {
   if (!d || !/\d{4}-\d{2}-\d{2}/.test(d)) return d || '—';
   const [y,m,dd] = d.split('-'); return `${dd}/${m}/${y}`;
 }
+// Dates avec logique AM/PM demandée
 function datePhrase(rec) {
   const a = rec.date_from;
   const b = rec.date_to || rec.date_from;
@@ -165,52 +170,65 @@ function getSignatureHtml(admin) {
 }
 
 // ====== Mailer (Resend OU Gmail) ======
-let resend = null;
-let transporter = null;
+let sendMail; // fonction d’envoi finale
+let MAIL_FROM_EFFECTIVE = ''; // pour logs et /api/mail-verify
 
 if (MAIL_PROVIDER === 'resend') {
-  resend = new Resend(RESEND_API_KEY);
-  console.log('✉️  MAIL provider = Resend');
+  const { Resend } = require('resend');
+  const resend = new Resend(RESEND_API_KEY);
+  // tant que pas de domaine vérifié Resend, il faut utiliser onboarding@resend.dev
+  const RESEND_FROM = 'onboarding@resend.dev';
+  MAIL_FROM_EFFECTIVE = `${MAIL_FROM_NAME} <${RESEND_FROM}>`;
+
+  sendMail = async ({ to, cc = [], subject, html }) => {
+    const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
+    const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
+    try {
+      const resp = await resend.emails.send({
+        from: MAIL_FROM_EFFECTIVE,
+        to: toList,
+        cc: ccList,
+        subject,
+        html,
+      });
+      return resp;
+    } catch (e) {
+      console.error('Resend send error:', e?.message || e);
+      if (e?.response?.data) console.error('Resend response:', e.response.data);
+      throw e;
+    }
+  };
+  console.log(`📬 MAIL provider = Resend | FROM = ${MAIL_FROM_EFFECTIVE}`);
+
 } else {
-  transporter = nodemailer.createTransport({
+  // Gmail SMTP
+  const nodemailer = require('nodemailer');
+  const transporter = nodemailer.createTransport({
     host: MAIL_HOST,
     port: MAIL_PORT,
-    secure: false,           // STARTTLS sur 587
+    secure: false,        // 587 = STARTTLS
     requireTLS: true,
+    auth: { user: MAIL_USER, pass: MAIL_PASS },
     tls: { minVersion: 'TLSv1.2' },
-    auth: MAIL_USER && MAIL_PASS ? { user: MAIL_USER, pass: MAIL_PASS } : undefined,
   });
-  transporter.verify()
-    .then(() => console.log(`📮 Gmail SMTP ready (${MAIL_HOST}:${MAIL_PORT}) as ${MAIL_USER || 'MISSING'}`))
-    .catch(e => console.error('📮 Gmail verify failed:', e?.message || e));
-  console.log('✉️  MAIL provider = Gmail/SMTP');
-}
+  MAIL_FROM_EFFECTIVE = `${MAIL_FROM_NAME} <${MAIL_USER}>`;
 
-async function sendMail({ to, cc = [], subject, html }) {
-  const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
-  const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
-
-  if (MAIL_PROVIDER === 'resend') {
-    const resp = await resend.emails.send({
-      from: `${MAIL_FROM_NAME} <${MAIL_FROM}>`,
-      to: toList,
-      cc: ccList,
+  sendMail = async ({ to, cc = [], subject, html }) => {
+    const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
+    const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
+    return transporter.sendMail({
+      from: MAIL_FROM_EFFECTIVE,
+      to: toList.join(', '),
+      cc: ccList.join(', '),
       subject,
       html,
+      envelope: { from: MAIL_USER, to: [...toList, ...ccList] },
     });
-    if (resp?.error) throw new Error(resp.error.message || 'Resend send error');
-    return resp;
-  }
+  };
 
-  const fromEmail = MAIL_USER || MAIL_FROM; // sécurité si MAIL_USER manquant
-  return transporter.sendMail({
-    from: `"${MAIL_FROM_NAME}" <${fromEmail}>`,
-    to: toList.join(', '),
-    cc: ccList.join(', '),
-    subject,
-    html,
-    envelope: { from: fromEmail, to: [...toList, ...ccList] },
-  });
+  transporter.verify()
+    .then(() => console.log(`📬 MAIL provider = Gmail | FROM = ${MAIL_FROM_EFFECTIVE}`))
+    .catch(e => console.error('Gmail verify failed:', e?.message || e));
 }
 
 // ====== Seed admins (1re exécution) ======
@@ -233,14 +251,8 @@ mongoose.connection.on('connected', async () => {
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 app.get('/api/mail-verify', async (req,res) => {
   try {
-    if (MAIL_PROVIDER === 'resend') {
-      return res.json({ ok: true, provider: 'resend', from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` });
-    }
-    await transporter.verify();
-    res.json({ ok: true, provider: 'gmail', host: MAIL_HOST, port: MAIL_PORT, user: MAIL_USER });
-  } catch(e) {
-    res.status(500).json({ ok:false, provider: MAIL_PROVIDER, error: e.message });
-  }
+    res.json({ ok:true, provider: MAIL_PROVIDER, from: MAIL_FROM_EFFECTIVE });
+  } catch(e){ res.status(500).json({ ok:false, error:e.message }); }
 });
 
 // ====== Auth ======
@@ -264,6 +276,7 @@ app.post('/api/auth/change-password', authRequired, async (req,res) => {
 });
 
 // ====== Requests ======
+// Création ➜ notifie les admins
 app.post('/api/requests', async (req,res) => {
   const b = req.body || {};
   const required = ['fullName','applicantEmail','entity','dateFrom','dateTo','place','type','managerEmail','hrEmail','days'];
@@ -309,16 +322,21 @@ app.post('/api/requests', async (req,res) => {
   return res.json({ ok: true, id: rec._id.toString() });
 });
 
+// Liste (normalisée avec id)
 app.get('/api/requests', authRequired, async (req,res) => {
   const status = (req.query.status || '').toLowerCase();
   const q = status ? { status } : {};
   const items = await Request.find(q).sort({ created_at: -1 }).lean();
   return res.json({
-    items: (items || []).map(x => ({ ...x, id: (x._id || x.id || '').toString(), _id: undefined }))
+    items: (items || []).map(x => ({
+      ...x,
+      id: (x._id || x.id || '').toString(),
+      _id: undefined
+    }))
   });
 });
 
-// Validation (TO: manager + RH + Reine + Chrystelle ; CC: demandeur)
+// Validation (TO = manager + RH + Reine + Chrystelle ; CC = demandeur uniquement)
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -421,6 +439,7 @@ app.post('/internal/cron/reminders', async (req,res) => {
 
   const today = todayParisISO();
   const pending = await Request.find({ status: 'pending' });
+
   const admins = await Admin.find({}).lean();
   const adminEmails = admins.map(a => a.email);
 
