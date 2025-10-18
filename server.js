@@ -1,4 +1,4 @@
-// server.js — Backend (Mongo + JWT + Resend en priorité, fallback Gmail SMTP) + Alertes + Relances quotidiennes
+// server.js — Backend (Mongo + JWT + Mailer switch Resend/Gmail + Alertes + Relances quotidiennes)
 
 const express = require('express');
 const cors = require('cors');
@@ -17,20 +17,19 @@ const {
   CRON_SECRET,
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
 
+  // Sélection du provider d'e-mail: 'resend' (recommandé) ou 'gmail'
+  MAIL_PROVIDER = process.env.MAIL_PROVIDER || 'resend',
+
   // Resend
   RESEND_API_KEY,
-  // adresse d'expédition quand tu auras un domaine vérifié Resend.
-  // À défaut, on utilisera onboarding@resend.dev (autorisé en test).
-  MAIL_FROM = process.env.MAIL_FROM,
+  MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev',
+  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 
-  // SMTP Gmail (fallback si pas de RESEND_API_KEY)
+  // Gmail (utilisé uniquement si MAIL_PROVIDER='gmail')
   MAIL_HOST = process.env.MAIL_HOST || 'smtp.gmail.com',
   MAIL_PORT = Number(process.env.MAIL_PORT || 587),
   MAIL_USER = process.env.MAIL_USER || '',
   MAIL_PASS = process.env.MAIL_PASS || '',
-
-  // Nom d'émetteur (utilisé pour Resend et SMTP)
-  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 } = process.env;
 
 if (!MONGODB_URI || !JWT_SECRET) {
@@ -66,7 +65,7 @@ async function connectWithRetry() {
     console.log('✅ MongoDB connected');
   } catch (e) {
     console.error('MongoDB connection error:', e?.message || e);
-    setTimeout(connectWithRetry, 5005);
+    setTimeout(connectWithRetry, 5000);
   }
 }
 connectWithRetry();
@@ -165,44 +164,46 @@ function getSignatureHtml(admin) {
   return `<p><strong>${admin.name}</strong><br/>${title}</p>`;
 }
 
-// ====== Mailers: Resend (prioritaire) + Gmail fallback ======
-const usingResend = !!RESEND_API_KEY;
+// ====== Mailer (Resend OU Gmail) ======
 let resend = null;
-if (usingResend) {
+let transporter = null;
+
+if (MAIL_PROVIDER === 'resend') {
   resend = new Resend(RESEND_API_KEY);
-  console.log('✉️  Mail provider: RESEND');
+  console.log('✉️  MAIL provider = Resend');
 } else {
-  console.log('✉️  Mail provider: GMAIL SMTP fallback');
-}
-
-const smtpTransporter = nodemailer.createTransport({
-  host: MAIL_HOST,
-  port: MAIL_PORT,         // 587
-  secure: false,           // STARTTLS
-  auth: MAIL_USER && MAIL_PASS ? { user: MAIL_USER, pass: MAIL_PASS } : undefined,
-  requireTLS: true,
-  tls: { minVersion: 'TLSv1.2' }
-});
-
-async function sendViaResend({ to, cc = [], subject, html }) {
-  const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
-  const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
-  const fromEmail = MAIL_FROM || 'onboarding@resend.dev'; // si pas de domaine vérifié
-  return resend.emails.send({
-    from: `${MAIL_FROM_NAME} <${fromEmail}>`,
-    to: toList,
-    cc: ccList,
-    subject,
-    html,
-    reply_to: MAIL_USER || undefined,
+  transporter = nodemailer.createTransport({
+    host: MAIL_HOST,
+    port: MAIL_PORT,
+    secure: false,           // STARTTLS sur 587
+    requireTLS: true,
+    tls: { minVersion: 'TLSv1.2' },
+    auth: MAIL_USER && MAIL_PASS ? { user: MAIL_USER, pass: MAIL_PASS } : undefined,
   });
+  transporter.verify()
+    .then(() => console.log(`📮 Gmail SMTP ready (${MAIL_HOST}:${MAIL_PORT}) as ${MAIL_USER || 'MISSING'}`))
+    .catch(e => console.error('📮 Gmail verify failed:', e?.message || e));
+  console.log('✉️  MAIL provider = Gmail/SMTP');
 }
 
-async function sendViaSmtp({ to, cc = [], subject, html }) {
+async function sendMail({ to, cc = [], subject, html }) {
   const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
   const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
-  const fromEmail = MAIL_USER || 'no-reply@example.com';
-  return smtpTransporter.sendMail({
+
+  if (MAIL_PROVIDER === 'resend') {
+    const resp = await resend.emails.send({
+      from: `${MAIL_FROM_NAME} <${MAIL_FROM}>`,
+      to: toList,
+      cc: ccList,
+      subject,
+      html,
+    });
+    if (resp?.error) throw new Error(resp.error.message || 'Resend send error');
+    return resp;
+  }
+
+  const fromEmail = MAIL_USER || MAIL_FROM; // sécurité si MAIL_USER manquant
+  return transporter.sendMail({
     from: `"${MAIL_FROM_NAME}" <${fromEmail}>`,
     to: toList.join(', '),
     cc: ccList.join(', '),
@@ -211,29 +212,6 @@ async function sendViaSmtp({ to, cc = [], subject, html }) {
     envelope: { from: fromEmail, to: [...toList, ...ccList] },
   });
 }
-
-// API commune
-async function sendMail(opts) {
-  if (usingResend) {
-    try { return await sendViaResend(opts); }
-    catch (e) {
-      console.error('Resend send error -> fallback SMTP:', e?.message || e);
-      return await sendViaSmtp(opts);
-    }
-  }
-  return await sendViaSmtp(opts);
-}
-
-// Vérifications au boot
-(async () => {
-  if (usingResend) {
-    try { await resend.domains.list(); console.log('📮 RESEND ready'); }
-    catch (e) { console.error('📮 RESEND check failed:', e?.message || e); }
-  } else {
-    try { await smtpTransporter.verify(); console.log(`📮 SMTP ready (${MAIL_HOST}:${MAIL_PORT}) FROM=${MAIL_FROM_NAME}`); }
-    catch (e) { console.error('📮 SMTP verify failed:', e?.message || e); }
-  }
-})();
 
 // ====== Seed admins (1re exécution) ======
 mongoose.connection.on('connected', async () => {
@@ -255,13 +233,13 @@ mongoose.connection.on('connected', async () => {
 app.get('/api/health', (req,res) => res.json({ ok: true }));
 app.get('/api/mail-verify', async (req,res) => {
   try {
-    if (usingResend) {
-      return res.json({ ok:true, provider:'resend', from: `${MAIL_FROM_NAME} <${MAIL_FROM || 'onboarding@resend.dev'}>` });
+    if (MAIL_PROVIDER === 'resend') {
+      return res.json({ ok: true, provider: 'resend', from: `${MAIL_FROM_NAME} <${MAIL_FROM}>` });
     }
-    await smtpTransporter.verify();
-    return res.json({ ok:true, provider:'smtp', host: MAIL_HOST, port: MAIL_PORT, from: `${MAIL_FROM_NAME} <${MAIL_USER || 'missing'}>` });
-  } catch(e){
-    return res.status(500).json({ ok:false, error:e.message });
+    await transporter.verify();
+    res.json({ ok: true, provider: 'gmail', host: MAIL_HOST, port: MAIL_PORT, user: MAIL_USER });
+  } catch(e) {
+    res.status(500).json({ ok:false, provider: MAIL_PROVIDER, error: e.message });
   }
 });
 
@@ -331,24 +309,20 @@ app.post('/api/requests', async (req,res) => {
   return res.json({ ok: true, id: rec._id.toString() });
 });
 
-// Liste
 app.get('/api/requests', authRequired, async (req,res) => {
   const status = (req.query.status || '').toLowerCase();
   const q = status ? { status } : {};
   const items = await Request.find(q).sort({ created_at: -1 }).lean();
   return res.json({
-    items: (items || []).map(x => ({
-      ...x,
-      id: (x._id || x.id || '').toString(),
-      _id: undefined
-    }))
+    items: (items || []).map(x => ({ ...x, id: (x._id || x.id || '').toString(), _id: undefined }))
   });
 });
 
-// Validation (TO = manager + RH + Reine + Chrystelle ; CC = demandeur)
+// Validation (TO: manager + RH + Reine + Chrystelle ; CC: demandeur)
 app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
+
   const rec = await Request.findById(id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
 
@@ -379,10 +353,11 @@ app.post('/api/requests/:id/validate', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Refus
+// Refus (mail au demandeur)
 app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
+
   const rec = await Request.findById(id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
 
@@ -408,10 +383,11 @@ app.post('/api/requests/:id/refuse', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Annulation
+// Annulation (mail au demandeur)
 app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   const { id } = req.params;
   if (!isValidId(id)) return res.status(400).json({ error: 'Invalid id' });
+
   const rec = await Request.findById(id);
   if (!rec) return res.status(404).json({ error: 'Not found' });
 
@@ -437,7 +413,7 @@ app.post('/api/requests/:id/cancel', authRequired, async (req,res) => {
   return res.json({ ok: true });
 });
 
-// Relances quotidiennes
+// Relances quotidiennes (Cron Render à 08:00 Europe/Paris)
 app.post('/internal/cron/reminders', async (req,res) => {
   if (CRON_SECRET && req.query.token !== CRON_SECRET) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -445,7 +421,6 @@ app.post('/internal/cron/reminders', async (req,res) => {
 
   const today = todayParisISO();
   const pending = await Request.find({ status: 'pending' });
-
   const admins = await Admin.find({}).lean();
   const adminEmails = admins.map(a => a.email);
 
@@ -474,5 +449,4 @@ app.post('/internal/cron/reminders', async (req,res) => {
 
 // ====== Start ======
 app.listen(PORT, () => console.log(`🚀 API listening on port ${PORT}`));
-
 
