@@ -1,10 +1,10 @@
-// server.js — Backend (Mongo + JWT + Gmail SMTP via MAIL_* + Alertes + Relances quotidiennes)
-// Utilise UNIQUEMENT les variables MAIL_*
-// - MAIL_HOST  = smtp.gmail.com
-// - MAIL_PORT  = 587
-// - MAIL_USER  = ton_adresse@gmail.com
-// - MAIL_PASS  = mot_de_passe_application (16 char sans espaces)
-// - MAIL_FROM_NAME = Détachements CGT-SG Article 21 CSEC-SG
+// server.js — Backend (Mongo + JWT + Resend en priorité, fallback Gmail SMTP)
+// ENV nécessaires :
+// - RESEND_API_KEY (si présent => Resend utilisé)
+// - [optionnel] MAIL_FROM (si domaine Resend vérifié, sinon from = onboarding@resend.dev)
+// - MAIL_FROM_NAME (nom d'expéditeur affiché)
+// - MAIL_USER (utilisé pour reply-to ; et pour fallback Gmail si RESEND_ABSENT)
+// - [fallback Gmail] MAIL_HOST=smtp.gmail.com, MAIL_PORT=587, MAIL_PASS=app_password
 // Autres: MONGODB_URI, JWT_SECRET, APP_BASE_URL, CRON_SECRET, CORS_ORIGINS
 
 const express = require('express');
@@ -13,6 +13,7 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
 // ====== ENV ======
 const {
@@ -23,12 +24,16 @@ const {
   CRON_SECRET,
   CORS_ORIGINS = process.env.CORS_ORIGINS || APP_BASE_URL,
 
-  // UNIQUEMENT les MAIL_* :
-  MAIL_HOST = 'smtp.gmail.com',
+  // Resend
+  RESEND_API_KEY,
+  MAIL_FROM = process.env.MAIL_FROM, // si domaine vérifié Resend ; sinon on utilisera onboarding@resend.dev
+  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
+
+  // Fallback Gmail SMTP (si pas de RESEND_API_KEY)
+  MAIL_HOST = process.env.MAIL_HOST || 'smtp.gmail.com',
   MAIL_PORT = Number(process.env.MAIL_PORT || 587),
   MAIL_USER = process.env.MAIL_USER || '',
   MAIL_PASS = process.env.MAIL_PASS || '',
-  MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Détachements CGT-SG Article 21 CSEC-SG',
 } = process.env;
 
 if (!MONGODB_URI || !JWT_SECRET) {
@@ -164,40 +169,72 @@ function getSignatureHtml(admin) {
   return `<p><strong>${admin.name}</strong><br/>${title}</p>`;
 }
 
-// ====== Mailer (Gmail via MAIL_*) ======
-console.log(`✉️  MAIL config -> host=${MAIL_HOST} port=${MAIL_PORT} user=${MAIL_USER ? '[set]' : '(missing)'} fromName="${MAIL_FROM_NAME}"`);
+// ====== Mailers ======
+// Resend (prioritaire si clé fournie)
+const useResend = !!RESEND_API_KEY;
+const resend = useResend ? new Resend(RESEND_API_KEY) : null;
 
-const transporter = nodemailer.createTransport({
-  host: MAIL_HOST,             // smtp.gmail.com
-  port: MAIL_PORT,             // 587
-  secure: false,               // STARTTLS (ne pas passer à true sur 587)
-  auth: MAIL_USER && MAIL_PASS ? { user: MAIL_USER, pass: MAIL_PASS } : undefined,
-  requireTLS: true,            // force STARTTLS
-  tls: { minVersion: 'TLSv1.2' }
-});
+// Fallback Gmail SMTP (si pas de Resend)
+const smtpTransporter = (!useResend && MAIL_USER && MAIL_PASS)
+  ? nodemailer.createTransport({
+      host: MAIL_HOST,
+      port: MAIL_PORT,
+      secure: false,        // STARTTLS sur 587
+      auth: { user: MAIL_USER, pass: MAIL_PASS },
+      requireTLS: true,
+      tls: { minVersion: 'TLSv1.2' }
+    })
+  : null;
 
-// Expéditeur = MAIL_USER pour éviter 530 ; nom = MAIL_FROM_NAME
+// Fonction unique d’envoi
 async function sendMail({ to, cc = [], subject, html }) {
   const toList = Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
   const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
-  const fromEmail = MAIL_USER;
 
-  return transporter.sendMail({
-    from: `"${MAIL_FROM_NAME}" <${fromEmail}>`,
-    to: toList.join(', '),
-    cc: ccList.join(', '),
-    subject,
-    html,
-    envelope: { from: fromEmail, to: [...toList, ...ccList] },
-  });
+  if (useResend) {
+    const fromAddr = MAIL_FROM || 'onboarding@resend.dev';
+    const from = `${MAIL_FROM_NAME} <${fromAddr}>`;
+    const payload = {
+      from,
+      to: toList,
+      cc: ccList.length ? ccList : undefined,
+      subject,
+      html,
+      reply_to: MAIL_USER || undefined,
+    };
+    const r = await resend.emails.send(payload);
+    if (r.error) throw new Error(r.error.message || 'Resend error');
+    return r;
+  }
+
+  if (smtpTransporter) {
+    const fromEmail = MAIL_USER;
+    return smtpTransporter.sendMail({
+      from: `"${MAIL_FROM_NAME}" <${fromEmail}>`,
+      to: toList.join(', '),
+      cc: ccList.join(', '),
+      subject,
+      html,
+      envelope: { from: fromEmail, to: [...toList, ...ccList] },
+    });
+  }
+
+  throw new Error('No mail provider configured.');
 }
 
-transporter.verify()
-  .then(() => console.log(`📮 MAIL ready (${MAIL_HOST}:${MAIL_PORT}) FROM=${MAIL_FROM_NAME} <${MAIL_USER || 'MISSING'}>`))
-  .catch(e => {
-    console.error('📮 MAIL verify failed:', e?.message || e);
-    console.error('👉 Pour Gmail : MAIL_HOST=smtp.gmail.com, MAIL_PORT=587, app password 16 chars (sans espaces).');
-  });
+// Health/verify mail
+app.get('/api/mail-verify', async (req,res) => {
+  try {
+    if (useResend) return res.json({ ok:true, provider:'resend', from: `${MAIL_FROM_NAME} <${MAIL_FROM || 'onboarding@resend.dev'}>` });
+    if (smtpTransporter) {
+      await smtpTransporter.verify();
+      return res.json({ ok:true, provider:'gmail-smtp', host: MAIL_HOST, port: MAIL_PORT, from: `${MAIL_FROM_NAME} <${MAIL_USER}>` });
+    }
+    res.status(500).json({ ok:false, error:'no mail provider' });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
 
 // ====== Seed admins (1re exécution) ======
 mongoose.connection.on('connected', async () => {
@@ -215,12 +252,8 @@ mongoose.connection.on('connected', async () => {
   console.log('👥 Admins seeded.');
 });
 
-// ====== Health / Debug ======
+// ====== Health ======
 app.get('/api/health', (req,res) => res.json({ ok: true }));
-app.get('/api/mail-verify', async (req,res) => {
-  try { await transporter.verify(); res.json({ ok:true, host: MAIL_HOST, port: MAIL_PORT, from: `${MAIL_FROM_NAME} <${MAIL_USER}>` }); }
-  catch(e){ res.status(500).json({ ok:false, error:e.message, host:MAIL_HOST, port:MAIL_PORT }); }
-});
 
 // ====== Auth ======
 app.post('/api/auth/login', async (req,res) => {
@@ -434,6 +467,11 @@ app.post('/internal/cron/reminders', async (req,res) => {
 });
 
 // ====== Start ======
-app.listen(PORT, () => console.log(`🚀 API listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 API listening on port ${PORT}`);
+  console.log(useResend
+    ? `✉️  Using Resend (from=${MAIL_FROM || 'onboarding@resend.dev'})`
+    : (smtpTransporter ? `✉️  Using Gmail SMTP (${MAIL_HOST}:${MAIL_PORT})` : '✉️  No mail provider configured'));
+});
 
 
